@@ -123,18 +123,11 @@ jobs:
           $fqdn = $status.Self.DNSName
           "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: 📦 Install winget (App Installer)
-        run: |
-          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile AppInstaller.msixbundle
-            Add-AppxPackage AppInstaller.msixbundle
-          }
-          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { Write-Warning "winget still not available; installs may be skipped." }
-
-      - name: 🧰 Apps & Shortcuts
+      # (No winget install step; runners block MSIX. We'll use winget if present, else fall back to Chocolatey.)
+      - name: 🧰 Apps & Shortcuts (winget if available, else Chocolatey)
         run: |
           $ErrorActionPreference = "Continue"
-          function Wing { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$args) if (Get-Command winget -ErrorAction SilentlyContinue) { winget @args --silent --accept-source-agreements --accept-package-agreements | Out-Host } else { Write-Warning "winget not found; skipping: $args" } }
+
           function Add-Shortcut { param($Name,$Target) try {
             $Desktop=[Environment]::GetFolderPath("Desktop")
             $Path=Join-Path $Desktop "$Name.lnk"
@@ -143,6 +136,7 @@ jobs:
             $S.TargetPath=$Target; $S.Save()
             Write-Host "Shortcut added: $Name"
           } catch { Write-Warning "Shortcut failed $Name : $_" } }
+
           function Add-WebShortcut { param($Name,$Url) try {
             $Desktop=[Environment]::GetFolderPath("Desktop")
             $Path=Join-Path $Desktop "$Name.url"
@@ -151,25 +145,55 @@ jobs:
             Write-Host "Web shortcut added: $Name"
           } catch { Write-Warning "Web shortcut failed $Name : $_" } }
 
-          # Uninstall unwanted
-          Wing uninstall --id EpicGames.EpicGamesLauncher
-          Wing uninstall --id RProject.R --version 4.4.2
-          Wing uninstall --id UnityTechnologies.UnityHub
+          $haveWinget = Get-Command winget -ErrorAction SilentlyContinue
+          if ($haveWinget) {
+            Write-Host "✅ Using winget"
+            $wing = { param([Parameter(ValueFromRemainingArguments=$true)][string[]]$args) winget @args --silent --accept-source-agreements --accept-package-agreements | Out-Host }
+            # Uninstall unwanted
+            & $wing uninstall --id EpicGames.EpicGamesLauncher
+            & $wing uninstall --id RProject.R --version 4.4.2
+            & $wing uninstall --id UnityTechnologies.UnityHub
+            # Install wanted
+            & $wing install --id Mozilla.Firefox.DeveloperEdition
+            & $wing install --id Brave.Brave
+            & $wing install --id VivaldiTechnologies.Vivaldi
+            & $wing install --id Opera.OperaGX
+            & $wing install --id WhatsApp.WhatsApp
+            & $wing install --id Telegram.TelegramDesktop
+            & $wing install --id VideoLAN.VLC
+            & $wing install --id Ookla.Speedtest
+            & $wing install --id ProtonVPN.ProtonVPN
+            & $wing install --id Microsoft.BingWallpaper
+            & $wing install --id Microsoft.OneDrive
+          }
+          else {
+            Write-Warning "winget not available; installing Chocolatey and using choco fallback."
+            try {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+              Invoke-Expression (Invoke-WebRequest https://community.chocolatey.org/install.ps1 -UseBasicParsing).Content
+            } catch { Write-Warning "Chocolatey install failed: $_" }
+            function ch { param([string]$pkg) try { choco install -y $pkg | Out-Host } catch { Write-Warning "choco failed for $pkg : $_" } }
+            function chrm { param([string]$pkg) try { choco uninstall -y $pkg | Out-Host } catch { Write-Warning "choco uninstall failed for $pkg : $_" } }
+            # Uninstall unwanted (best-effort names)
+            chrm epicgameslauncher
+            chrm r.project  # may not match; best-effort
+            chrm unity-hub
+            # Install wanted (best-effort names)
+            ch brave
+            ch vivaldi
+            ch opera-gx
+            ch whatsapp
+            ch telegram
+            ch vlc
+            ch speedtest
+            ch protonvpn
+            # Bing wallpaper/OneDrive often not on choco; skipped if missing
+            ch bing-wallpaper
+            ch onedrive
+          }
 
-          # Install browsers / tools
-          Wing install --id Mozilla.Firefox.DeveloperEdition
-          Wing install --id Brave.Brave
-          Wing install --id VivaldiTechnologies.Vivaldi
-          Wing install --id Opera.OperaGX
-          Wing install --id WhatsApp.WhatsApp
-          Wing install --id Telegram.TelegramDesktop
-          Wing install --id VideoLAN.VLC
-          Wing install --id Ookla.Speedtest
-          Wing install --id ProtonVPN.ProtonVPN
-          Wing install --id Microsoft.BingWallpaper
-          Wing install --id Microsoft.OneDrive
-
-          # Web shortcuts (always work)
+          # Web shortcuts always
           Add-WebShortcut -Name "ChatGPT"  -Url "https://chat.openai.com/"
           Add-WebShortcut -Name "Instagram" -Url "https://www.instagram.com/"
           Add-WebShortcut -Name "Gmail"     -Url "https://mail.google.com/"
