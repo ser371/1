@@ -1,0 +1,115 @@
+name: "⚡ EnigMano B (Tailscale bullet • RDP • auto-loop)"
+
+on:
+  repository_dispatch:
+    types: [enigmano_b]
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    name: "🚀 B: EnigMano bullet"
+    runs-on: windows-2022
+    timeout-minutes: 480
+
+    env:
+      RAW_EVENT: ${{ toJson(github.event) }}
+      GH_TOKEN_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
+      FIXED_USER: "bullettemporary"
+      FIXED_PASS: "Bullet@12345"
+
+    steps:
+      - name: 📦 Read payload
+        id: cfg
+        run: |
+          $ev = ConvertFrom-Json -InputObject $env:RAW_EVENT
+          $p  = $ev.client_payload
+          $tailnet = $p.TS_TAILNET
+          $apikey  = $p.TS_API_KEY
+          $authkey = $p.TS_AUTHKEY
+          $test    = [bool]$p.TEST_MODE
+          $apitok  = $p.GH_API_TOKEN
+          $runtime = if ($test) { 5 } else { 360 }
+          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apikey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authkey" | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "testmode=$test"   | Out-File -Append $env:GITHUB_OUTPUT
+          "apitok=$apitok"   | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: 🧹 PURGE bullet* (start — tolerant)
+        run: |
+          $headers = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn      = "${{ steps.cfg.outputs.tailnet }}"
+          $base    = "https://api.tailscale.com/api/v2"
+          $uri     = "$base/tailnet/$([uri]::EscapeDataString($tn))/devices"
+          try { $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers } catch { Write-Warning "List devices failed: $_"; exit 0 }
+          foreach ($d in $resp.devices) {
+            $name=$d.name; $id=$d.id
+            $isExternal = $false
+            if ($d.PSObject.Properties.Name -contains "isExternal") { $isExternal = [bool]$d.isExternal }
+            if ($name -match '^(?i)bullet(\b|-|_|$)' -and -not $isExternal) {
+              try { Invoke-RestMethod -Method DELETE -Uri "$base/device/$id" -Headers $headers; Write-Host "Deleted $name ($id)" }
+              catch { Write-Warning "Skip deleting $name ($id)" }
+            }
+          }
+
+      - name: ⚙️ Install Tailscale
+        run: |
+          choco install tailscale -y --no-progress
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      - name: 🔗 tailscale up (hostname=bullet)
+        run: |
+          $exe="C:\Program Files\Tailscale\tailscale.exe"
+          & $exe logout | Out-Null
+          & $exe up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "bullet" --accept-dns=true --accept-routes=true --force-reauth
+          & $exe status
+
+      - name: 🧰 Enable RDP (fixed user/pass)
+        run: |
+          $user=$env:FIXED_USER; $pass=$env:FIXED_PASS
+          if (net user | Select-String -Pattern "^\s*$user\s*$") { net user $user $pass /Y } else { net user $user $pass /add /Y }
+          net localgroup "Remote Desktop Users" $user /add
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          Write-Host "RDP ready. User: $user  Pass: $pass"
+
+      - name: 🔎 MagicDNS debug
+        run: |
+          $exe="C:\Program Files\Tailscale\tailscale.exe"
+          $ipv4=& $exe ip -4
+          $fqdn="bullet.${{ steps.cfg.outputs.tailnet }}.ts.net"
+          Write-Host "IPv4: $ipv4"
+          Write-Host "MagicDNS: $fqdn"
+
+      - name: ⏳ Keep alive
+        run: |
+          $mins=[int]"${{ steps.cfg.outputs.runtime }}"; $total=$mins*60
+          for ($i=0; $i -lt $total; $i+=30) { Write-Host "alive $i/$total"; Start-Sleep -Seconds 30 }
+
+      - name: 🔁 Dispatch A (uses PAT if provided)
+        if: always()
+        env:
+          TOKEN_INPUT: ${{ steps.cfg.outputs.apitok }}
+          TOKEN_FALLBACK: ${{ env.GH_TOKEN_FALLBACK }}
+        run: |
+          $token = if ($env:TOKEN_INPUT) { $env:TOKEN_INPUT } else { $env:TOKEN_FALLBACK }
+          $body = @{
+            event_type = "enigmano_a"
+            client_payload = @{
+              TS_TAILNET = "${{ steps.cfg.outputs.tailnet }}"
+              TS_API_KEY = "${{ steps.cfg.outputs.apikey }}"
+              TS_AUTHKEY = "${{ steps.cfg.outputs.authkey }}"
+              TEST_MODE  = "${{ steps.cfg.outputs.testmode }}"
+              GH_API_TOKEN = $token
+            }
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers @{Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
+          Write-Host "Triggered enigmano_a"
