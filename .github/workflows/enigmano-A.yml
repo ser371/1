@@ -18,7 +18,7 @@ on:
         required: true
         default: false
       GH_API_TOKEN:
-        description: "(Optional) PAT for GitHub dispatch (if needed)"
+        description: "(Optional) PAT for GitHub dispatch; leave blank to use default GITHUB_TOKEN"
         required: false
 
   repository_dispatch:
@@ -118,26 +118,32 @@ jobs:
           net localgroup "Remote Desktop Users" $user /add
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          Write-Host "RDP enabled. Use $user / $pass"
+          Write-Host "RDP ready. User: $user  Pass: $pass"
 
       - name: 🔎 MagicDNS & DERP debug
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           $ipv4 = & $exe ip -4
+          $ipv6 = & $exe ip -6
+          $json = & $exe status --json | Out-String | ConvertFrom-Json
+          $region="unknown"
+          if ($json.Self.DERP -and $json.DERPMap.Regions) { $rid=$json.Self.DERP; $reg=$json.DERPMap.Regions.$rid; if ($reg){$region=$reg.RegionName} }
           $fqdn = "bullet.${{ steps.cfg.outputs.tailnet }}.ts.net"
           Write-Host "IPv4: $ipv4"
+          Write-Host "IPv6: $ipv6"
           Write-Host "MagicDNS: $fqdn"
+          Write-Host "DERP region: $region"
 
       - name: ⏳ Keep alive
         run: |
           $mins=[int]"${{ steps.cfg.outputs.runtime }}"; $total=$mins*60
           for ($i=0; $i -lt $total; $i+=30) { Write-Host "alive $i/$total"; Start-Sleep -Seconds 30 }
 
-      - name: 🔁 Dispatch B
+      - name: 🔁 Dispatch B (uses PAT if provided)
         if: always()
         env:
           TOKEN_INPUT: ${{ steps.cfg.outputs.apitok }}
-          TOKEN_FALLBACK: ${{ env:GH_TOKEN_FALLBACK }}
+          TOKEN_FALLBACK: ${{ env.GH_TOKEN_FALLBACK }}
         run: |
           $token = if ($env:TOKEN_INPUT) { $env:TOKEN_INPUT } else { $env:TOKEN_FALLBACK }
           $body = @{
@@ -151,3 +157,4 @@ jobs:
             }
           } | ConvertTo-Json -Depth 5
           Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers @{Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
+          Write-Host "Triggered enigmano_b"
