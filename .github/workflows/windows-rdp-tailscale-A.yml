@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com or company.com)"
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
         description: "Tailscale API key (device admin) — DO NOT add 'Bearer'"
@@ -13,7 +13,7 @@ on:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
       gh_api_token:
-        description: "(Optional) GitHub PAT for dispatch; blank = use default GITHUB_TOKEN"
+        description: "(Optional) GitHub PAT; blank = use default GITHUB_TOKEN"
         required: false
       test_mode:
         description: "Run 5-minute test loop"
@@ -27,14 +27,6 @@ on:
         description: "How many loops (A→B→A…). 0 = infinite"
         required: false
         default: "0"
-      purge_pattern:
-        description: "Regex to purge device names at start/end"
-        required: false
-        default: '^(?i)bullet(\b|\.|-)'
-
-  workflow_run:
-    workflows: ["Windows RDP via Tailscale (B)"]
-    types: [completed]
 
 permissions:
   contents: write
@@ -53,32 +45,18 @@ jobs:
   rdp:
     runs-on: windows-2022
     timeout-minutes: 370
-
     steps:
-      - name: 🔧 Resolve config (dispatch form or repo payload)
+      - name: 🔧 Resolve inputs
         id: cfg
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
-          if ($ev.inputs) {
-            $tailnet = $ev.inputs.ts_tailnet
-            $apiKey  = $ev.inputs.ts_api_key
-            $authKey = $ev.inputs.ts_authkey
-            $apiTok  = $ev.inputs.gh_api_token
-            $test    = [bool]$ev.inputs.test_mode
-            $runtime = [int]($ev.inputs.runtime_minutes)
-            $loops   = [int]($ev.inputs.loops)
-            $purge   = if ($ev.inputs.purge_pattern) { $ev.inputs.purge_pattern } else { '^(?i)bullet(\b|\.|-)' }
-          } else {
-            $p       = $ev.client_payload
-            $tailnet = $p.ts_tailnet
-            $apiKey  = $p.ts_api_key
-            $authKey = $p.ts_authkey
-            $apiTok  = $p.gh_api_token
-            $test    = [bool]$p.test_mode
-            $runtime = [int]$p.runtime_minutes
-            $loops   = [int]$p.loops
-            $purge   = if ($p.purge_pattern) { $p.purge_pattern } else { '^(?i)bullet(\b|\.|-)' }
-          }
+          $tailnet = $ev.inputs.ts_tailnet
+          $apiKey  = $ev.inputs.ts_api_key
+          $authKey = $ev.inputs.ts_authkey
+          $apiTok  = $ev.inputs.gh_api_token
+          $test    = [bool]$ev.inputs.test_mode
+          $runtime = [int]$ev.inputs.runtime_minutes
+          $loops   = [int]$ev.inputs.loops
 
           if (-not $tailnet -or -not $apiKey -or -not $authKey) {
             Write-Error "Missing required inputs (tailnet / api_key / authkey)."
@@ -88,17 +66,16 @@ jobs:
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
           if ($runtime -gt 355) { $runtime = 355 }
-          if ($loops -lt 0) { $loops = 0 }  # 0 = infinite
+          if ($loops -lt 0) { $loops = 0 } # 0 = infinite
 
-          "tailnet=$tailnet"         | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$apiKey"           | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$authKey"         | Out-File -Append $env:GITHUB_OUTPUT
-          "apitok=$apiTok"           | Out-File -Append $env:GITHUB_OUTPUT
-          "runtime=$runtime"         | Out-File -Append $env:GITHUB_OUTPUT
-          "loops=$loops"             | Out-File -Append $env:GITHUB_OUTPUT
-          "purge_pattern=$purge"     | Out-File -Append $env:GITHUB_OUTPUT
+          "tailnet=$tailnet"     | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apiKey"       | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authKey"     | Out-File -Append $env:GITHUB_OUTPUT
+          "apitok=$apiTok"       | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime"     | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"         | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: ⚙️ Install Tailscale (if missing) & show version
+      - name: ⚙️ Install Tailscale (if missing) & version
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -110,7 +87,7 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: 🔐 Enable RDP + user + firewall (fixed creds)
+      - name: 🔐 Enable RDP + user + firewall
         run: |
           $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
@@ -125,11 +102,11 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      - name: 🧹 Purge devices matching pattern (startup)
+      - name: 🧹 Purge bullet* devices (startup)
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
-          $pat = "${{ steps.cfg.outputs.purge_pattern }}"
+          $pat = '^(?i)bullet(\b|\.|-)'
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
@@ -160,12 +137,12 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: 🧹 Purge devices (exit)
+      - name: 🧹 Purge bullet* devices (exit)
         if: always()
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
-          $pat = "${{ steps.cfg.outputs.purge_pattern }}"
+          $pat = '^(?i)bullet(\b|\.|-)'
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
@@ -175,21 +152,18 @@ jobs:
             }
           } catch { Write-Warning "Exit purge failed: $_" }
 
-      - name: 🔁 Dispatch B (or stop if loops finished)
+      - name: 🔁 Dispatch workflow B (no delay)
         if: always()
         env:
           GH_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $loops = [int]"${{ steps.cfg.outputs.loops }}"
           if ($loops -gt 0) { $nextLoops = $loops - 1 } else { $nextLoops = 0 }  # 0 = infinite
-          if ($loops -eq 1) {
-            Write-Host "Loops finished; not dispatching B."
-            exit 0
-          }
+          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching B."; exit 0 }
           $token = if ("${{ steps.cfg.outputs.apitok }}") { "${{ steps.cfg.outputs.apitok }}" } else { "$env:GH_FALLBACK" }
-          $body = @{
-            event_type = "enigmano_b"
-            client_payload = @{
+          $body  = @{
+            ref    = "${{ github.ref_name }}"
+            inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
               ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
               ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
@@ -197,7 +171,9 @@ jobs:
               test_mode       = $false
               runtime_minutes = [int]"${{ steps.cfg.outputs.runtime }}"
               loops           = $nextLoops
-              purge_pattern   = "${{ steps.cfg.outputs.purge_pattern }}"
             }
           } | ConvertTo-Json -Depth 5
-          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers @{ Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
+            -Body $body
