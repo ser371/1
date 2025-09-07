@@ -20,21 +20,17 @@ on:
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime per run (minutes, max 360; we cap to 355). Ignored if Test Mode is ON."
+        description: "Runtime per run (minutes, max 360; capped to 355 when not in test mode)"
         required: false
         default: "355"
       loops:
-        description: "How many loops (A→B→A...). 0 = infinite"
+        description: "How many loops (A→B→A…). 0 = infinite"
         required: false
         default: "0"
-      hostname:
-        description: "Tailscale hostname"
-        required: false
-        default: "bullet"
       purge_pattern:
         description: "Regex to purge device names at start/end"
         required: false
-        default: "^(?i)bullet(\b|\.|-)"
+        default: '^(?i)bullet(\b|\.|-)'
 
   workflow_run:
     workflows: ["Windows RDP via Tailscale (B)"]
@@ -51,6 +47,7 @@ defaults:
 env:
   RDP_USER: Bullettemporary
   RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
 
 jobs:
   rdp:
@@ -70,8 +67,7 @@ jobs:
             $test    = [bool]$ev.inputs.test_mode
             $runtime = [int]($ev.inputs.runtime_minutes)
             $loops   = [int]($ev.inputs.loops)
-            $host    = if ($ev.inputs.hostname) { $ev.inputs.hostname } else { "bullet" }
-            $purge   = if ($ev.inputs.purge_pattern) { $ev.inputs.purge_pattern } else { "^(?i)bullet(\b|\.|-)" }
+            $purge   = if ($ev.inputs.purge_pattern) { $ev.inputs.purge_pattern } else { '^(?i)bullet(\b|\.|-)' }
           } else {
             $p       = $ev.client_payload
             $tailnet = $p.ts_tailnet
@@ -81,8 +77,7 @@ jobs:
             $test    = [bool]$p.test_mode
             $runtime = [int]$p.runtime_minutes
             $loops   = [int]$p.loops
-            $host    = if ($p.hostname) { $p.hostname } else { "bullet" }
-            $purge   = if ($p.purge_pattern) { $p.purge_pattern } else { "^(?i)bullet(\b|\.|-)" }
+            $purge   = if ($p.purge_pattern) { $p.purge_pattern } else { '^(?i)bullet(\b|\.|-)' }
           }
 
           if (-not $tailnet -or -not $apiKey -or -not $authKey) {
@@ -90,7 +85,6 @@ jobs:
             exit 1
           }
 
-          # Apply test mode + caps
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
           if ($runtime -gt 355) { $runtime = 355 }
@@ -102,7 +96,6 @@ jobs:
           "apitok=$apiTok"           | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime"         | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"             | Out-File -Append $env:GITHUB_OUTPUT
-          "hostname=$host"           | Out-File -Append $env:GITHUB_OUTPUT
           "purge_pattern=$purge"     | Out-File -Append $env:GITHUB_OUTPUT
 
       - name: ⚙️ Install Tailscale (if missing) & show version
@@ -140,23 +133,22 @@ jobs:
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
-              $name = $d.name
-              if ($name -match $pat) {
+              if ($d.name -match $pat) {
                 try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }
-                catch { Write-Warning "Skip delete $name ($($d.id))" }
+                catch { Write-Warning "Skip delete $($d.name)" }
               }
             }
           } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: 🔗 Tailscale up (fixed hostname)
+      - name: 🔗 Tailscale up (hostname=bullet)
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ steps.cfg.outputs.hostname }}" --accept-routes --accept-dns=false
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
-          "### RDP CONNECT (A)`nHost: ${{ steps.cfg.outputs.hostname }}`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "### RDP CONNECT (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: ⏳ Keep alive
         run: |
@@ -205,7 +197,6 @@ jobs:
               test_mode       = $false
               runtime_minutes = [int]"${{ steps.cfg.outputs.runtime }}"
               loops           = $nextLoops
-              hostname        = "${{ steps.cfg.outputs.hostname }}"
               purge_pattern   = "${{ steps.cfg.outputs.purge_pattern }}"
             }
           } | ConvertTo-Json -Depth 5
