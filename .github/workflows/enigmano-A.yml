@@ -1,46 +1,38 @@
 name: "⚡ EnigMano A (Tailscale bullet • RDP • auto-loop)"
 
 on:
+  # Manual start with prompts
   workflow_dispatch:
     inputs:
-      INSTANCE:
-        description: "Instance number (e.g., 1,2,3...)"
-        required: false
-        default: "1"
       TS_TAILNET:
-        description: "Tailscale tailnet (e.g., you@gmail.com or company.com) — leave blank to use stored"
-        required: false
+        description: "Tailscale tailnet (you@gmail.com or company.com)"
+        required: true
       TS_API_KEY:
-        description: "Tailscale API key (device admin) — leave blank to use stored"
-        required: false
+        description: "Tailscale API key (device admin)"
+        required: true
       TS_AUTHKEY:
-        description: "Tailscale auth key (reusable or ephemeral) — leave blank to use stored"
-        required: false
+        description: "Tailscale auth key (reusable/ephemeral)"
+        required: true
       RDP_USER:
-        description: "Local Windows username for RDP (e.g., bullet)"
-        required: false
+        description: "Local Windows username"
+        required: true
         default: "bullet"
       RDP_PASS:
         description: "Password for the RDP user"
-        required: false
-      RUNTIME_MINUTES:
-        description: "Keep-alive minutes (job stays up for RDP during this time)"
-        required: false
-        default: "10"
-      SAVE_FOR_FUTURE:
-        description: "Save provided values to Repository Variables for one-time setup? (true/false)"
-        required: false
-        default: "false"
-  workflow_run:
-    workflows: ["⚡ EnigMano B (Tailscale bullet • RDP • auto-loop)"]
-    types: [completed]
+        required: true
+      TEST_MODE:
+        description: "Run 5-minute test mode?"
+        type: boolean
+        required: true
+        default: false
+
+  # Auto re-entry from B without storing anything
+  repository_dispatch:
+    types: [enigmano_a]
 
 permissions:
   contents: read
-
-concurrency:
-  group: enigmano-bullet-a
-  cancel-in-progress: false
+  actions: write  # needed to dispatch the other workflow
 
 defaults:
   run:
@@ -53,73 +45,49 @@ jobs:
     timeout-minutes: 480
 
     env:
-      # Inputs
-      IN_TAILNET:         ${{ github.event.inputs.TS_TAILNET }}
-      IN_APIKEY:          ${{ github.event.inputs.TS_API_KEY }}
-      IN_AUTHKEY:         ${{ github.event.inputs.TS_AUTHKEY }}
-      IN_RDP_USER:        ${{ github.event.inputs.RDP_USER }}
-      IN_RDP_PASS:        ${{ github.event.inputs.RDP_PASS }}
-      IN_RUNTIME_MIN:     ${{ github.event.inputs.RUNTIME_MINUTES }}
-      SAVE_FLAG:          ${{ github.event.inputs.SAVE_FOR_FUTURE || 'false' }}
-      # Stored repo variables (used if inputs are blank)
-      VAR_TAILNET:        ${{ vars.TS_TAILNET }}
-      VAR_APIKEY:         ${{ vars.TS_API_KEY }}
-      VAR_AUTHKEY:        ${{ vars.TS_AUTHKEY }}
-      VAR_RDP_USER:       ${{ vars.TS_RDP_USER }}
-      VAR_RDP_PASS:       ${{ vars.TS_RDP_PASS }}
-      VAR_RUNTIME_MIN:    ${{ vars.TS_RUNTIME_MIN }}
+      RAW_EVENT: ${{ toJson(github.event) }}
+      OWNER: ${{ github.repository_owner }}
+      REPO:  ${{ github.event.repository.name }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      - name: 📌 Resolve configuration (prefer inputs → fallback to stored)
+      - name: 📦 Resolve config (from dispatch form or repository_dispatch payload)
         id: cfg
         run: |
-          $tailnet = if ($env:IN_TAILNET)  { $env:IN_TAILNET }  else { $env:VAR_TAILNET }
-          $apikey  = if ($env:IN_APIKEY)   { $env:IN_APIKEY }   else { $env:VAR_APIKEY }
-          $authkey = if ($env:IN_AUTHKEY)  { $env:IN_AUTHKEY }  else { $env:VAR_AUTHKEY }
-          $rdpUser = if ($env:IN_RDP_USER) { $env:IN_RDP_USER } else { if ($env:VAR_RDP_USER) { $env:VAR_RDP_USER } else { "bullet" } }
-          $rdpPass = if ($env:IN_RDP_PASS) { $env:IN_RDP_PASS } else { $env:VAR_RDP_PASS }
-          $runtime = if ($env:IN_RUNTIME_MIN) { [int]$env:IN_RUNTIME_MIN } else { if ($env:VAR_RUNTIME_MIN) { [int]$env:VAR_RUNTIME_MIN } else { 10 } }
+          $ev = ConvertFrom-Json -InputObject $env:RAW_EVENT
+          $isRepoDispatch = $ev.action -eq "enigmano_a" -or $ev.event_type -eq "enigmano_a"
 
-          if (-not $tailnet -or -not $apikey -or -not $authkey -or -not $rdpPass) {
-            Write-Error "❌ Missing values. Provide TS_TAILNET, TS_API_KEY, TS_AUTHKEY, and RDP_PASS in the dispatch form (or save once with SAVE_FOR_FUTURE=true)."
+          if ($isRepoDispatch) {
+            $p = $ev.client_payload
+            $tailnet = $p.TS_TAILNET
+            $apikey  = $p.TS_API_KEY
+            $authkey = $p.TS_AUTHKEY
+            $rdpuser = $p.RDP_USER
+            $rdppass = $p.RDP_PASS
+            $test    = [bool]$p.TEST_MODE
+          } else {
+            $tailnet = "${{ github.event.inputs.TS_TAILNET }}"
+            $apikey  = "${{ github.event.inputs.TS_API_KEY }}"
+            $authkey = "${{ github.event.inputs.TS_AUTHKEY }}"
+            $rdpuser = "${{ github.event.inputs.RDP_USER }}"
+            $rdppass = "${{ github.event.inputs.RDP_PASS }}"
+            $test    = ("${{ github.event.inputs.TEST_MODE }}" -eq "true")
+          }
+
+          if (-not $tailnet -or -not $apikey -or -not $authkey -or -not $rdppass -or -not $rdpuser) {
+            Write-Error "Missing required inputs."
             exit 1
           }
 
+          $runtime = if ($test) { 5 } else { 360 }  # 5 minutes test; else 6 hours
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apikey"   | Out-File -Append $env:GITHUB_OUTPUT
           "authkey=$authkey" | Out-File -Append $env:GITHUB_OUTPUT
-          "rdpuser=$rdpUser" | Out-File -Append $env:GITHUB_OUTPUT
-          "rdppass=$rdpPass" | Out-File -Append $env:GITHUB_OUTPUT
+          "rdpuser=$rdpuser" | Out-File -Append $env:GITHUB_OUTPUT
+          "rdppass=$rdppass" | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
-
-          Write-Host "✅ Config ready. Tailnet: $tailnet | RDP user: $rdpUser | Runtime: $runtime min"
-
-      - name: 💾 (Optional) Save to Repository Variables (one-time)
-        if: ${{ env.SAVE_FLAG == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $owner,$repo = "${{ github.repository }}".Split("/")
-          $base = "https://api.github.com/repos/$owner/$repo/actions/variables"
-          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "X-GitHub-Api-Version" = "2022-11-28" }
-
-          function Upsert-Var($n,$v){
-            if (-not $v) { return }
-            $url = "$base/$n"
-            $has = Invoke-RestMethod -Headers $headers -Method GET -Uri $url -ErrorAction SilentlyContinue
-            $body = @{ name=$n; value=$v } | ConvertTo-Json
-            if ($has) { Invoke-RestMethod -Headers $headers -Method PATCH -Uri $url -ContentType "application/json" -Body $body }
-            else      { Invoke-RestMethod -Headers $headers -Method POST  -Uri $base -ContentType "application/json" -Body $body }
-            Write-Host "Stored variable: $n"
-          }
-
-          Upsert-Var "TS_TAILNET"   "${{ steps.cfg.outputs.tailnet }}"
-          Upsert-Var "TS_API_KEY"   "${{ steps.cfg.outputs.apikey }}"
-          Upsert-Var "TS_AUTHKEY"   "${{ steps.cfg.outputs.authkey }}"
-          Upsert-Var "TS_RDP_USER"  "${{ steps.cfg.outputs.rdpuser }}"
-          Upsert-Var "TS_RDP_PASS"  "${{ steps.cfg.outputs.rdppass }}"
-          Upsert-Var "TS_RUNTIME_MIN" "${{ steps.cfg.outputs.runtime }}"
-          Write-Host "✅ Saved for future runs. (Reminder: Variables are not encrypted.)"
+          "testmode=$test"   | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "✅ Config OK. TestMode=$test, Runtime=$runtime min"
 
       - name: 🧹 PURGE tailnet devices (start) — delete bullet*
         run: |
@@ -130,79 +98,48 @@ jobs:
           $resp    = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
           $pattern = '^(?i)bullet(\b|-|_|$)'
           $resp.devices | Where-Object { $_.name -match $pattern } | ForEach-Object {
-            Write-Host "Deleting device $($_.id) ($($_.name))"
             Invoke-RestMethod -Method DELETE -Uri "$base/device/$($_.id)" -Headers $headers
+            Write-Host "Deleted $($_.name)"
           }
 
-      - name: ⚙️ Install Tailscale fast
+      - name: ⚙️ Install Tailscale
         run: |
           choco install tailscale -y --no-progress
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
       - name: 🔗 tailscale up (hostname=bullet)
-        id: tsup
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           & $exe logout | Out-Null
           & $exe up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "bullet" --accept-dns=true --accept-routes=true --force-reauth
           & $exe status
 
-      - name: 🧰 Enable RDP + create user + firewall
+      - name: 🧰 Enable RDP (user, firewall, policy)
         run: |
-          $user = "${{ steps.cfg.outputs.rdpuser }}"
-          $pass = "${{ steps.cfg.outputs.rdppass }}"
-
-          # Create/update local user
-          $exists = net user | Select-String -Pattern "^\s*$user\s*$"
-          if ($exists) {
-            net user $user $pass /Y
-            Write-Host "Updated password for existing user '$user'."
-          } else {
-            net user $user $pass /add /Y
-            Write-Host "Created local user '$user'."
-          }
+          $user="${{ steps.cfg.outputs.rdpuser }}"; $pass="${{ steps.cfg.outputs.rdppass }}"
+          if (net user | Select-String -Pattern "^\s*$user\s*$") { net user $user $pass /Y } else { net user $user $pass /add /Y }
           net localgroup "Remote Desktop Users" $user /add
-
-          # Enable RDP
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
-
-          # Open firewall for RDP
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
 
-          # Optional: confirm
-          Write-Host "RDP enabled. User '$user' can sign in via tailnet IP."
-
-      - name: 🔎 MagicDNS/DERP debug
+      - name: 🔎 MagicDNS & DERP debug
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
-
           $ipv4 = & $exe ip -4
           $ipv6 = & $exe ip -6
-          Write-Host "Tailscale IPv4: $ipv4"
-          Write-Host "Tailscale IPv6: $ipv6"
-
           $json = & $exe status --json | Out-String | ConvertFrom-Json
-          # Best-effort DERP region name
-          $region = $null
-          if ($json.Self.DERP -and $json.DERPMap.Regions) {
-            $rid = $json.Self.DERP
-            $reg = $json.DERPMap.Regions.$rid
-            if ($reg) { $region = $reg.RegionName }
-          }
-          if (-not $region) { $region = "unknown" }
-
+          $region="unknown"
+          if ($json.Self.DERP -and $json.DERPMap.Regions) { $rid=$json.Self.DERP; $reg=$json.DERPMap.Regions.$rid; if ($reg){$region=$reg.RegionName} }
           $fqdn = "bullet.${{ steps.cfg.outputs.tailnet }}.ts.net"
-          Write-Host "MagicDNS FQDN (hint): $fqdn"
+          Write-Host "IPv4: $ipv4"
+          Write-Host "IPv6: $ipv6"
+          Write-Host "MagicDNS: $fqdn"
           Write-Host "DERP region: $region"
 
-      - name: ⏳ Keep alive for RDP session
+      - name: ⏳ Keep alive (RDP window)
         run: |
-          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
-          $total = $mins * 60
-          for ($i=1; $i -le $total; $i+=30) {
-            Write-Host "RDP keep-alive… ($i/$total sec)"
-            Start-Sleep -Seconds 30
-          }
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"; $total=$mins*60
+          for ($i=0; $i -lt $total; $i+=30) { Write-Host "alive $i/$total"; Start-Sleep -Seconds 30 }
 
       - name: 🧹 PURGE tailnet devices (end) — delete bullet*
         if: always()
@@ -214,6 +151,24 @@ jobs:
           $resp    = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
           $pattern = '^(?i)bullet(\b|-|_|$)'
           $resp.devices | Where-Object { $_.name -match $pattern } | ForEach-Object {
-            Write-Host "Deleting device $($_.id) ($($_.name))"
             Invoke-RestMethod -Method DELETE -Uri "$base/device/$($_.id)" -Headers $headers
+            Write-Host "Deleted $($_.name)"
           }
+
+      - name: 🔁 Dispatch B (no delay)
+        if: always()
+        run: |
+          $body = @{
+            event_type = "enigmano_b"
+            client_payload = @{
+              TS_TAILNET = "${{ steps.cfg.outputs.tailnet }}"
+              TS_API_KEY = "${{ steps.cfg.outputs.apikey }}"
+              TS_AUTHKEY = "${{ steps.cfg.outputs.authkey }}"
+              RDP_USER   = "${{ steps.cfg.outputs.rdpuser }}"
+              RDP_PASS   = "${{ steps.cfg.outputs.rdppass }}"
+              TEST_MODE  = "${{ steps.cfg.outputs.testmode }}"
+            }
+          } | ConvertTo-Json
+          $uri = "https://api.github.com/repos/${{ github.repository }}/dispatches"
+          Invoke-RestMethod -Method POST -Uri $uri -Headers @{Authorization="Bearer $env:GH_TOKEN"; "Accept"="application/vnd.github+json"} -Body $body
+          Write-Host "Triggered enigmano_b"
