@@ -1,0 +1,219 @@
+name: "⚡ EnigMano A (Tailscale bullet • RDP • auto-loop)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      INSTANCE:
+        description: "Instance number (e.g., 1,2,3...)"
+        required: false
+        default: "1"
+      TS_TAILNET:
+        description: "Tailscale tailnet (e.g., you@gmail.com or company.com) — leave blank to use stored"
+        required: false
+      TS_API_KEY:
+        description: "Tailscale API key (device admin) — leave blank to use stored"
+        required: false
+      TS_AUTHKEY:
+        description: "Tailscale auth key (reusable or ephemeral) — leave blank to use stored"
+        required: false
+      RDP_USER:
+        description: "Local Windows username for RDP (e.g., bullet)"
+        required: false
+        default: "bullet"
+      RDP_PASS:
+        description: "Password for the RDP user"
+        required: false
+      RUNTIME_MINUTES:
+        description: "Keep-alive minutes (job stays up for RDP during this time)"
+        required: false
+        default: "10"
+      SAVE_FOR_FUTURE:
+        description: "Save provided values to Repository Variables for one-time setup? (true/false)"
+        required: false
+        default: "false"
+  workflow_run:
+    workflows: ["⚡ EnigMano B (Tailscale bullet • RDP • auto-loop)"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: enigmano-bullet-a
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    name: "🚀 A: EnigMano bullet"
+    runs-on: windows-2022
+    timeout-minutes: 480
+
+    env:
+      # Inputs
+      IN_TAILNET:         ${{ github.event.inputs.TS_TAILNET }}
+      IN_APIKEY:          ${{ github.event.inputs.TS_API_KEY }}
+      IN_AUTHKEY:         ${{ github.event.inputs.TS_AUTHKEY }}
+      IN_RDP_USER:        ${{ github.event.inputs.RDP_USER }}
+      IN_RDP_PASS:        ${{ github.event.inputs.RDP_PASS }}
+      IN_RUNTIME_MIN:     ${{ github.event.inputs.RUNTIME_MINUTES }}
+      SAVE_FLAG:          ${{ github.event.inputs.SAVE_FOR_FUTURE || 'false' }}
+      # Stored repo variables (used if inputs are blank)
+      VAR_TAILNET:        ${{ vars.TS_TAILNET }}
+      VAR_APIKEY:         ${{ vars.TS_API_KEY }}
+      VAR_AUTHKEY:        ${{ vars.TS_AUTHKEY }}
+      VAR_RDP_USER:       ${{ vars.TS_RDP_USER }}
+      VAR_RDP_PASS:       ${{ vars.TS_RDP_PASS }}
+      VAR_RUNTIME_MIN:    ${{ vars.TS_RUNTIME_MIN }}
+
+    steps:
+      - name: 📌 Resolve configuration (prefer inputs → fallback to stored)
+        id: cfg
+        run: |
+          $tailnet = if ($env:IN_TAILNET)  { $env:IN_TAILNET }  else { $env:VAR_TAILNET }
+          $apikey  = if ($env:IN_APIKEY)   { $env:IN_APIKEY }   else { $env:VAR_APIKEY }
+          $authkey = if ($env:IN_AUTHKEY)  { $env:IN_AUTHKEY }  else { $env:VAR_AUTHKEY }
+          $rdpUser = if ($env:IN_RDP_USER) { $env:IN_RDP_USER } else { if ($env:VAR_RDP_USER) { $env:VAR_RDP_USER } else { "bullet" } }
+          $rdpPass = if ($env:IN_RDP_PASS) { $env:IN_RDP_PASS } else { $env:VAR_RDP_PASS }
+          $runtime = if ($env:IN_RUNTIME_MIN) { [int]$env:IN_RUNTIME_MIN } else { if ($env:VAR_RUNTIME_MIN) { [int]$env:VAR_RUNTIME_MIN } else { 10 } }
+
+          if (-not $tailnet -or -not $apikey -or -not $authkey -or -not $rdpPass) {
+            Write-Error "❌ Missing values. Provide TS_TAILNET, TS_API_KEY, TS_AUTHKEY, and RDP_PASS in the dispatch form (or save once with SAVE_FOR_FUTURE=true)."
+            exit 1
+          }
+
+          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apikey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authkey" | Out-File -Append $env:GITHUB_OUTPUT
+          "rdpuser=$rdpUser" | Out-File -Append $env:GITHUB_OUTPUT
+          "rdppass=$rdpPass" | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+
+          Write-Host "✅ Config ready. Tailnet: $tailnet | RDP user: $rdpUser | Runtime: $runtime min"
+
+      - name: 💾 (Optional) Save to Repository Variables (one-time)
+        if: ${{ env.SAVE_FLAG == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $owner,$repo = "${{ github.repository }}".Split("/")
+          $base = "https://api.github.com/repos/$owner/$repo/actions/variables"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; "X-GitHub-Api-Version" = "2022-11-28" }
+
+          function Upsert-Var($n,$v){
+            if (-not $v) { return }
+            $url = "$base/$n"
+            $has = Invoke-RestMethod -Headers $headers -Method GET -Uri $url -ErrorAction SilentlyContinue
+            $body = @{ name=$n; value=$v } | ConvertTo-Json
+            if ($has) { Invoke-RestMethod -Headers $headers -Method PATCH -Uri $url -ContentType "application/json" -Body $body }
+            else      { Invoke-RestMethod -Headers $headers -Method POST  -Uri $base -ContentType "application/json" -Body $body }
+            Write-Host "Stored variable: $n"
+          }
+
+          Upsert-Var "TS_TAILNET"   "${{ steps.cfg.outputs.tailnet }}"
+          Upsert-Var "TS_API_KEY"   "${{ steps.cfg.outputs.apikey }}"
+          Upsert-Var "TS_AUTHKEY"   "${{ steps.cfg.outputs.authkey }}"
+          Upsert-Var "TS_RDP_USER"  "${{ steps.cfg.outputs.rdpuser }}"
+          Upsert-Var "TS_RDP_PASS"  "${{ steps.cfg.outputs.rdppass }}"
+          Upsert-Var "TS_RUNTIME_MIN" "${{ steps.cfg.outputs.runtime }}"
+          Write-Host "✅ Saved for future runs. (Reminder: Variables are not encrypted.)"
+
+      - name: 🧹 PURGE tailnet devices (start) — delete bullet*
+        run: |
+          $headers = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn      = "${{ steps.cfg.outputs.tailnet }}"
+          $base    = "https://api.tailscale.com/api/v2"
+          $uri     = "$base/tailnet/$([uri]::EscapeDataString($tn))/devices"
+          $resp    = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
+          $pattern = '^(?i)bullet(\b|-|_|$)'
+          $resp.devices | Where-Object { $_.name -match $pattern } | ForEach-Object {
+            Write-Host "Deleting device $($_.id) ($($_.name))"
+            Invoke-RestMethod -Method DELETE -Uri "$base/device/$($_.id)" -Headers $headers
+          }
+
+      - name: ⚙️ Install Tailscale fast
+        run: |
+          choco install tailscale -y --no-progress
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      - name: 🔗 tailscale up (hostname=bullet)
+        id: tsup
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          & $exe logout | Out-Null
+          & $exe up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "bullet" --accept-dns=true --accept-routes=true --force-reauth
+          & $exe status
+
+      - name: 🧰 Enable RDP + create user + firewall
+        run: |
+          $user = "${{ steps.cfg.outputs.rdpuser }}"
+          $pass = "${{ steps.cfg.outputs.rdppass }}"
+
+          # Create/update local user
+          $exists = net user | Select-String -Pattern "^\s*$user\s*$"
+          if ($exists) {
+            net user $user $pass /Y
+            Write-Host "Updated password for existing user '$user'."
+          } else {
+            net user $user $pass /add /Y
+            Write-Host "Created local user '$user'."
+          }
+          net localgroup "Remote Desktop Users" $user /add
+
+          # Enable RDP
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
+
+          # Open firewall for RDP
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+
+          # Optional: confirm
+          Write-Host "RDP enabled. User '$user' can sign in via tailnet IP."
+
+      - name: 🔎 MagicDNS/DERP debug
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $ipv4 = & $exe ip -4
+          $ipv6 = & $exe ip -6
+          Write-Host "Tailscale IPv4: $ipv4"
+          Write-Host "Tailscale IPv6: $ipv6"
+
+          $json = & $exe status --json | Out-String | ConvertFrom-Json
+          # Best-effort DERP region name
+          $region = $null
+          if ($json.Self.DERP -and $json.DERPMap.Regions) {
+            $rid = $json.Self.DERP
+            $reg = $json.DERPMap.Regions.$rid
+            if ($reg) { $region = $reg.RegionName }
+          }
+          if (-not $region) { $region = "unknown" }
+
+          $fqdn = "bullet.${{ steps.cfg.outputs.tailnet }}.ts.net"
+          Write-Host "MagicDNS FQDN (hint): $fqdn"
+          Write-Host "DERP region: $region"
+
+      - name: ⏳ Keep alive for RDP session
+        run: |
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          $total = $mins * 60
+          for ($i=1; $i -le $total; $i+=30) {
+            Write-Host "RDP keep-alive… ($i/$total sec)"
+            Start-Sleep -Seconds 30
+          }
+
+      - name: 🧹 PURGE tailnet devices (end) — delete bullet*
+        if: always()
+        run: |
+          $headers = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn      = "${{ steps.cfg.outputs.tailnet }}"
+          $base    = "https://api.tailscale.com/api/v2"
+          $uri     = "$base/tailnet/$([uri]::EscapeDataString($tn))/devices"
+          $resp    = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
+          $pattern = '^(?i)bullet(\b|-|_|$)'
+          $resp.devices | Where-Object { $_.name -match $pattern } | ForEach-Object {
+            Write-Host "Deleting device $($_.id) ($($_.name))"
+            Invoke-RestMethod -Method DELETE -Uri "$base/device/$($_.id)" -Headers $headers
+          }
