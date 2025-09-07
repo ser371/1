@@ -7,24 +7,24 @@ on:
         description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin) — DO NOT add 'Bearer'"
+        description: "Tailscale API key (device admin, no 'Bearer')"
         required: true
       ts_authkey:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
       gh_api_token:
-        description: "GitHub Personal Access Token (classic) with scopes: repo, workflow (REQUIRED)"
+        description: "GitHub Personal Access Token (repo + workflow)"
         required: true
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime per run (minutes, max 360; capped to 355 when not in test mode)"
+        description: "Runtime in minutes (max 360, capped to 355)"
         required: false
         default: "355"
       loops:
-        description: "How many loops (A→B→A…). 0 = infinite"
+        description: "How many loops (0 = infinite)"
         required: false
         default: "0"
 
@@ -50,21 +50,20 @@ jobs:
         id: cfg
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
-          $tailnet = $ev.inputs.ts_tailnet
-          $apiKey  = $ev.inputs.ts_api_key
-          $authKey = $ev.inputs.ts_authkey
-          $apiTok  = $ev.inputs.gh_api_token
-          $test    = [bool]$ev.inputs.test_mode
-          $runtime = [int]$ev.inputs.runtime_minutes
-          $loops   = [int]$ev.inputs.loops
+          $i = $ev.inputs
+          $tailnet = $i.ts_tailnet
+          $apiKey  = $i.ts_api_key
+          $authKey = $i.ts_authkey
+          $apiTok  = $i.gh_api_token
+          $test    = [bool]$i.test_mode
+          $runtime = [int]$i.runtime_minutes
+          $loops   = [int]$i.loops
 
-          if (-not $tailnet -or -not $apiKey -or -not $authKey) { Write-Error "Missing required inputs (tailnet / api_key / authkey)."; exit 1 }
-          if (-not $apiTok) { Write-Error "gh_api_token (PAT with repo+workflow) is REQUIRED."; exit 1 }
-
+          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $apiTok) {
+            Write-Error "Missing required inputs"; exit 1
+          }
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
-          if ($runtime -gt 355) { $runtime = 355 }
-          if ($loops -lt 0) { $loops = 0 } # 0 = infinite
 
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
@@ -73,7 +72,7 @@ jobs:
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: ⚙️ Install Tailscale (if missing) & version
+      - name: ⚙️ Install Tailscale
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -85,7 +84,7 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: 🔐 Enable RDP + user + firewall
+      - name: 🔐 Enable RDP user + firewall
         run: |
           $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
@@ -98,23 +97,24 @@ jobs:
             Enable-LocalUser -Name $u
           }
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
       - name: 🧹 Purge bullet* devices (startup)
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
-          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          $tn = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
           $pat = '^(?i)bullet(\b|\.|-)'
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if ($d.name -match $pat) {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null } catch { Write-Warning "Skip delete $($d.name)" }
+                Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                Write-Host "Deleted: $($d.name)"
               }
             }
-          } catch { Write-Warning "Startup purge failed: $_" }
+          } catch { Write-Warning "Purge failed: $_" }
 
-      - name: 🔗 Tailscale up (hostname=bullet)
+      - name: 🔗 Tailscale up
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
@@ -122,47 +122,32 @@ jobs:
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
-          "### RDP CONNECT (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: 🧰 Uninstall + Install apps and create Desktop shortcuts
+      - name: 🧰 Apps & Shortcuts
         run: |
           $ErrorActionPreference = "Continue"
-          function Wing { param($args) winget $args --silent --accept-source-agreements --accept-package-agreements | Out-Host }
-          function Add-Shortcut($Name,$Target,$Args="",$Icon="") {
-            try {
-              $Desktop = [Environment]::GetFolderPath("Desktop")
-              $Path = Join-Path $Desktop "$Name.lnk"
-              $Wsh = New-Object -ComObject WScript.Shell
-              $Shortcut = $Wsh.CreateShortcut($Path)
-              $Shortcut.TargetPath = $Target
-              if ($Args)  { $Shortcut.Arguments  = $Args }
-              if ($Icon)  { $Shortcut.IconLocation = $Icon }
-              $Shortcut.WorkingDirectory = Split-Path $Target -Parent
-              $Shortcut.Save()
-              Write-Host "Shortcut added: $Name"
-            } catch { Write-Warning "Shortcut failed for $Name : $_" }
-          }
-          function Add-WebShortcut($Name,$Url){
-            try {
-              $Desktop = [Environment]::GetFolderPath("Desktop")
-              $Path = Join-Path $Desktop "$Name.url"
-              $Content = @"
-[InternetShortcut]
-URL=$Url
-IconFile=%SystemRoot%\system32\url.dll
-IconIndex=0
-"@
-              $Content | Out-File -Encoding ascii $Path
-              Write-Host "Web shortcut added: $Name"
-            } catch { Write-Warning "Web shortcut failed $Name : $_" }
-          }
+          function Wing { param([string[]]$args) winget @args --silent --accept-source-agreements --accept-package-agreements | Out-Host }
+          function Add-Shortcut { param($Name,$Target) try {
+            $Desktop=[Environment]::GetFolderPath("Desktop")
+            $Path=Join-Path $Desktop "$Name.lnk"
+            $Wsh=New-Object -ComObject WScript.Shell
+            $S=$Wsh.CreateShortcut($Path)
+            $S.TargetPath=$Target; $S.Save()
+            Write-Host "Shortcut added: $Name"
+          } catch { Write-Warning "Shortcut failed $Name" } }
+          function Add-WebShortcut { param($Name,$Url) try {
+            $Desktop=[Environment]::GetFolderPath("Desktop")
+            $Path=Join-Path $Desktop "$Name.url"
+            $Content="[InternetShortcut]`nURL=$Url`nIconFile=%SystemRoot%\system32\url.dll`nIconIndex=0"
+            Set-Content -Path $Path -Value $Content -Encoding Ascii
+            Write-Host "Web shortcut added: $Name"
+          } catch { Write-Warning "Web shortcut failed $Name" } }
 
-          # Uninstall unwanted
           Wing uninstall --id EpicGames.EpicGamesLauncher
           Wing uninstall --id RProject.R --version 4.4.2
           Wing uninstall --id UnityTechnologies.UnityHub
 
-          # Install browsers / tools
           Wing install --id Mozilla.Firefox.DeveloperEdition
           Wing install --id Brave.Brave
           Wing install --id VivaldiTechnologies.Vivaldi
@@ -175,33 +160,16 @@ IconIndex=0
           Wing install --id Microsoft.BingWallpaper
           Wing install --id Microsoft.OneDrive
 
-          # Desktop shortcuts (best-effort)
-          $paths = @{
-            "Firefox Developer Edition" = "C:\Program Files\Firefox Developer Edition\firefox.exe"
-            "Brave Browser"             = "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-            "Vivaldi"                   = "C:\Program Files\Vivaldi\Application\vivaldi.exe"
-            "Opera GX"                  = "$env:LOCALAPPDATA\Programs\Opera GX\launcher.exe"
-            "WhatsApp"                  = "$env:LOCALAPPDATA\Microsoft\WindowsApps\WhatsApp.exe"
-            "Telegram"                  = "$env:APPDATA\Telegram Desktop\Telegram.exe"
-            "VLC media player"          = "C:\Program Files\VideoLAN\VLC\vlc.exe"
-            "Speedtest"                 = "C:\Program Files\Ookla\Speedtest\speedtest.exe"
-            "Proton VPN"                = "C:\Program Files\Proton\VPN\Proton VPN.exe"
-            "OneDrive"                  = "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe"
-          }
-          foreach ($k in $paths.Keys) {
-            $p = [Environment]::ExpandEnvironmentVariables($paths[$k])
-            if (Test-Path $p) { Add-Shortcut -Name $k -Target $p }
-          }
-          # Web shortcuts
-          Add-WebShortcut -Name "ChatGPT"  -Url "https://chat.openai.com/"
+          Add-WebShortcut -Name "ChatGPT" -Url "https://chat.openai.com/"
           Add-WebShortcut -Name "Instagram" -Url "https://www.instagram.com/"
+          Add-WebShortcut -Name "Gmail" -Url "https://mail.google.com/"
 
       - name: ⏳ Keep alive
         run: |
-          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
-          $end  = (Get-Date).AddMinutes($mins)
-          while ((Get-Date) -lt $end) {
-            $left = [int]([math]::Ceiling(($end - (Get-Date)).TotalMinutes))
+          $mins=[int]"${{ steps.cfg.outputs.runtime }}"
+          $end=(Get-Date).AddMinutes($mins)
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
             Write-Host "RDP alive... ($left min left)"
             Start-Sleep -Seconds 60
           }
@@ -209,38 +177,28 @@ IconIndex=0
       - name: 🧹 Purge bullet* devices (exit)
         if: always()
         run: |
-          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
-          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
-          $pat = '^(?i)bullet(\b|\.|-)'
+          $hdr=@{ Authorization="Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn=[uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          $pat='^(?i)bullet(\b|\.|-)'
           try {
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
-            foreach ($d in $resp.devices) {
-              if ($d.name -match $pat) {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null } catch {}
-              }
-            }
-          } catch { Write-Warning "Exit purge failed: $_" }
+            $resp=Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            foreach($d in $resp.devices){ if($d.name -match $pat){ Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null } }
+          } catch { Write-Warning "Exit purge failed" }
 
-      - name: 🔁 Dispatch workflow B (no delay; requires PAT)
+      - name: 🔁 Dispatch B
         if: always()
         run: |
-          $loops = [int]"${{ steps.cfg.outputs.loops }}"
-          if ($loops -gt 0) { $nextLoops = $loops - 1 } else { $nextLoops = 0 }  # 0 = infinite
-          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching B."; exit 0 }
-          $token = "${{ steps.cfg.outputs.apitok }}"
-          $body  = @{
-            ref    = "${{ github.ref_name }}"
-            inputs = @{
-              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
-              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token    = $token
-              test_mode       = $false
-              runtime_minutes = [int]"${{ steps.cfg.outputs.runtime }}"
-              loops           = $nextLoops
-            }
-          } | ConvertTo-Json -Depth 5
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
+          $loops=[int]"${{ steps.cfg.outputs.loops }}"
+          if($loops -eq 1){ Write-Host "Loops finished"; exit 0 }
+          if($loops -gt 1){ $next=$loops-1 } else { $next=0 }
+          $token="${{ steps.cfg.outputs.apitok }}"
+          $body=@{ ref="${{ github.ref_name }}"; inputs=@{
+            ts_tailnet="${{ steps.cfg.outputs.tailnet }}"
+            ts_api_key="${{ steps.cfg.outputs.apikey }}"
+            ts_authkey="${{ steps.cfg.outputs.authkey }}"
+            gh_api_token=$token
+            test_mode=$false
+            runtime_minutes=[int]"${{ steps.cfg.outputs.runtime }}"
+            loops=$next
+          }} | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" -Headers @{ Authorization="Bearer $token"; Accept="application/vnd.github+json" } -Body $body
