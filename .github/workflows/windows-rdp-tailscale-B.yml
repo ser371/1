@@ -1,54 +1,37 @@
 name: Windows RDP via Tailscale (B)
 
 on:
-  repository_dispatch:
-    types: [enigmano_b]
+  workflow_run:
+    workflows: ["Windows RDP via Tailscale (A)"]
+    types: [completed]
 
 permissions:
-  contents: write
+  contents: read
   actions: write
-
-concurrency:
-  group: rdp-tailscale-chain
-  cancel-in-progress: false
-
-defaults:
-  run:
-    shell: pwsh
-
-env:
-  RDP_USER: Bullettemporary
-  RDP_PASS: Bullet@12345
-  TS_HOSTNAME: bullet
 
 jobs:
   rdp:
     runs-on: windows-2022
     timeout-minutes: 370
-
-    env:
-      RAW_EVENT: ${{ toJson(github.event) }}
-
     steps:
-      - name: Read payload
+      - name: 🧾 Read payload
         id: cfg
+        shell: pwsh
         run: |
-          $ev = ConvertFrom-Json -InputObject $env:RAW_EVENT
+          $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
           $p  = $ev.client_payload
           $tailnet = $p.ts_tailnet
-          $apiKey  = $p.ts_api_key
-          $authKey = $p.ts_authkey
+          $apikey  = $p.ts_api_key
+          $authkey = $p.ts_authkey
           $test    = [bool]$p.test_mode
-          $apiTok  = $p.gh_api_token
-          $runtime = if ($test) { 10 } else { 355 }
+          $runtime = if ($test) { 5 } else { 355 }
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apikey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authkey" | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
-          "testmode=$test"   | Out-File -Append $env:GITHUB_OUTPUT
-          "apitok=$apiTok"   | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: Install Tailscale
+      - name: ⚡ Install Tailscale
+        shell: pwsh
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -58,52 +41,46 @@ jobs:
             Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
-          & "C:\Program Files\Tailscale\tailscale.exe" version
+          & $exe version
 
-      - name: Enable RDP (fixed user/pass)
+      - name: 🔐 Enable RDP user + firewall
+        shell: pwsh
         run: |
-          $u = "${{ env.RDP_USER }}"
-          $p = "${{ env.RDP_PASS }}"
+          $u = "Bullettemporary"; $p = "Bullet@12345"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires -PasswordNeverExpires:$true
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
             Add-LocalGroupMember -Group Administrators -Member $u
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
           } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires:$true
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
             Enable-LocalUser -Name $u
           }
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Tailscale up
+      - name: 🧹 Purge bullet* devices
+        shell: pwsh
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+            foreach ($d in $resp.devices) {
+              if ($d.name -match '^(?i)bullet') {
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" }
+                catch { Write-Warning "Skip delete $($d.name)" }
+              }
+            }
+          } catch { Write-Warning "Purge failed: $_" }
+
+      - name: 🔗 Tailscale up
+        shell: pwsh
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
-          $ipv4 = (& $ts ip -4 | Select-Object -First 1)
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname bullet --accept-routes --accept-dns=false
+          $ip4 = & $ts ip -4 | Select-Object -First 1
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
-          "### RDP CONNECT (B)`nHost: $env:TS_HOSTNAME`nIPv4: $ipv4`nDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-
-      - name: Keep alive then dispatch A
-        env:
-          GH_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
-          Start-Sleep -Seconds ($mins * 60)
-          $token = if ("${{ steps.cfg.outputs.apitok }}") { "${{ steps.cfg.outputs.apitok }}" } else { "$env:GH_FALLBACK" }
-          $body = @{
-            event_type = "enigmano_a"
-            client_payload = @{
-              ts_tailnet   = "${{ steps.cfg.outputs.tailnet }}"
-              ts_api_key   = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey   = "${{ steps.cfg.outputs.authkey }}"
-              test_mode    = "${{ steps.cfg.outputs.testmode }}"
-              gh_api_token = $token
-            }
-          } | ConvertTo-Json -Depth 4
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
+          "### RDP CONNECT (B)`nHost: bullet`nIPv4: $ip4`nDNS: $fqdn`nUser: Bullettemporary`nPass: Bullet@12345" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
