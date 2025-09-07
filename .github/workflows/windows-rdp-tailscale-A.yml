@@ -58,9 +58,7 @@ jobs:
           $runtime = [int]$ev.inputs.runtime_minutes
           $loops   = [int]$ev.inputs.loops
 
-          if (-not $tailnet -or -not $apiKey -or -not $authKey) {
-            Write-Error "Missing required inputs (tailnet / api_key / authkey)."; exit 1
-          }
+          if (-not $tailnet -or -not $apiKey -or -not $authKey) { Write-Error "Missing required inputs (tailnet / api_key / authkey)."; exit 1 }
           if (-not $apiTok) { Write-Error "gh_api_token (PAT with repo+workflow) is REQUIRED."; exit 1 }
 
           if ($test) { $runtime = 5 }
@@ -111,8 +109,7 @@ jobs:
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if ($d.name -match $pat) {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }
-                catch { Write-Warning "Skip delete $($d.name)" }
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null } catch { Write-Warning "Skip delete $($d.name)" }
               }
             }
           } catch { Write-Warning "Startup purge failed: $_" }
@@ -146,15 +143,16 @@ jobs:
             } catch { Write-Warning "Shortcut failed for $Name : $_" }
           }
           function Add-WebShortcut($Name,$Url){
-            try{
+            try {
               $Desktop = [Environment]::GetFolderPath("Desktop")
               $Path = Join-Path $Desktop "$Name.url"
-              @"
+              $Content = @"
 [InternetShortcut]
 URL=$Url
 IconFile=%SystemRoot%\system32\url.dll
 IconIndex=0
-"@ | Out-File -Encoding ascii $Path
+"@
+              $Content | Out-File -Encoding ascii $Path
               Write-Host "Web shortcut added: $Name"
             } catch { Write-Warning "Web shortcut failed $Name : $_" }
           }
@@ -175,10 +173,9 @@ IconIndex=0
           Wing install --id Ookla.Speedtest
           Wing install --id ProtonVPN.ProtonVPN
           Wing install --id Microsoft.BingWallpaper
-          # OneDrive normally present; ensure up to date
           Wing install --id Microsoft.OneDrive
 
-          # Paths (best-effort)
+          # Desktop shortcuts (best-effort)
           $paths = @{
             "Firefox Developer Edition" = "C:\Program Files\Firefox Developer Edition\firefox.exe"
             "Brave Browser"             = "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
@@ -195,8 +192,8 @@ IconIndex=0
             $p = [Environment]::ExpandEnvironmentVariables($paths[$k])
             if (Test-Path $p) { Add-Shortcut -Name $k -Target $p }
           }
-          # Web shortcuts for services without reliable EXE
-          Add-WebShortcut -Name "ChatGPT" -Url "https://chat.openai.com/"
+          # Web shortcuts
+          Add-WebShortcut -Name "ChatGPT"  -Url "https://chat.openai.com/"
           Add-WebShortcut -Name "Instagram" -Url "https://www.instagram.com/"
 
       - name: ⏳ Keep alive
