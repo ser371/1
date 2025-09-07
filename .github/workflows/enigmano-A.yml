@@ -12,28 +12,21 @@ on:
       TS_AUTHKEY:
         description: "Tailscale auth key (reusable/ephemeral)"
         required: true
-      RDP_USER:
-        description: "Local Windows username"
-        required: true
-        default: "bullet"
-      RDP_PASS:
-        description: "Password for the RDP user"
-        required: true
       TEST_MODE:
         description: "Run 5-minute test mode?"
         type: boolean
         required: true
         default: false
       GH_API_TOKEN:
-        description: "(Optional) PAT to call GitHub API for dispatch; leave blank to use GITHUB_TOKEN"
+        description: "(Optional) PAT for GitHub dispatch (if needed)"
         required: false
 
   repository_dispatch:
     types: [enigmano_a]
 
 permissions:
-  contents: write        # needed by repository_dispatch in some repos
-  actions: write         # dispatch other workflows
+  contents: write
+  actions: write
 
 defaults:
   run:
@@ -48,9 +41,11 @@ jobs:
     env:
       RAW_EVENT: ${{ toJson(github.event) }}
       GH_TOKEN_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
+      FIXED_USER: "bullettemporary"
+      FIXED_PASS: "Bullet@12345"
 
     steps:
-      - name: 📦 Resolve config (dispatch form or repo_dispatch payload)
+      - name: 📦 Resolve config (dispatch form or repo_dispatch)
         id: cfg
         run: |
           $ev = ConvertFrom-Json -InputObject $env:RAW_EVENT
@@ -61,21 +56,17 @@ jobs:
             $tailnet = $p.TS_TAILNET
             $apikey  = $p.TS_API_KEY
             $authkey = $p.TS_AUTHKEY
-            $rdpuser = $p.RDP_USER
-            $rdppass = $p.RDP_PASS
             $test    = [bool]$p.TEST_MODE
             $apitok  = $p.GH_API_TOKEN
           } else {
             $tailnet = "${{ github.event.inputs.TS_TAILNET }}"
             $apikey  = "${{ github.event.inputs.TS_API_KEY }}"
             $authkey = "${{ github.event.inputs.TS_AUTHKEY }}"
-            $rdpuser = "${{ github.event.inputs.RDP_USER }}"
-            $rdppass = "${{ github.event.inputs.RDP_PASS }}"
             $test    = ("${{ github.event.inputs.TEST_MODE }}" -eq "true")
             $apitok  = "${{ github.event.inputs.GH_API_TOKEN }}"
           }
 
-          if (-not $tailnet -or -not $apikey -or -not $authkey -or -not $rdppass -or -not $rdpuser) {
+          if (-not $tailnet -or -not $apikey -or -not $authkey) {
             Write-Error "Missing required inputs."
             exit 1
           }
@@ -84,36 +75,27 @@ jobs:
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apikey"   | Out-File -Append $env:GITHUB_OUTPUT
           "authkey=$authkey" | Out-File -Append $env:GITHUB_OUTPUT
-          "rdpuser=$rdpuser" | Out-File -Append $env:GITHUB_OUTPUT
-          "rdppass=$rdppass" | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "testmode=$test"   | Out-File -Append $env:GITHUB_OUTPUT
           "apitok=$apitok"   | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "✅ Config OK. TestMode=$test, Runtime=$runtime min"
+          Write-Host "✅ Config OK. Runtime=$runtime min"
 
       - name: 🧹 PURGE bullet* (start — tolerant)
         run: |
           $headers = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn      = "${{ steps.cfg.outputs.tailnet }}"
           $base    = "https://api.tailscale.com/api/v2"
-          $uri     = "$base/tailnet/$([uri]::EscapeDataString($tn))/devices"
-          try {
-            $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers
-          } catch { Write-Warning "List devices failed: $_"; exit 0 }
+          try { $resp = Invoke-RestMethod -Uri "$base/tailnet/$([uri]::EscapeDataString($tn))/devices" -Headers $headers }
+          catch { Write-Warning "List devices failed: $_"; exit 0 }
 
           $pattern = '^(?i)bullet(\b|-|_|$)'
           foreach ($d in $resp.devices) {
-            $name = $d.name
-            $id   = $d.id
+            $name=$d.name; $id=$d.id
             $isExternal = $false
             if ($d.PSObject.Properties.Name -contains "isExternal") { $isExternal = [bool]$d.isExternal }
             if ($name -match $pattern -and -not $isExternal) {
-              try {
-                Invoke-RestMethod -Method DELETE -Uri "$base/device/$id" -Headers $headers
-                Write-Host "Deleted $name ($id)"
-              } catch {
-                Write-Warning "Skip deleting $name ($id): $($_.Exception.Response.StatusCode.value__) / $($_.ErrorDetails.Message)"
-              }
+              try { Invoke-RestMethod -Method DELETE -Uri "$base/device/$id" -Headers $headers; Write-Host "Deleted $name ($id)" }
+              catch { Write-Warning "Skip deleting $name ($id)" }
             }
           }
 
@@ -129,56 +111,33 @@ jobs:
           & $exe up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "bullet" --accept-dns=true --accept-routes=true --force-reauth
           & $exe status
 
-      - name: 🧰 Enable RDP (user, firewall, policy)
+      - name: 🧰 Enable RDP (fixed user/pass)
         run: |
-          $user="${{ steps.cfg.outputs.rdpuser }}"; $pass="${{ steps.cfg.outputs.rdppass }}"
+          $user=$env:FIXED_USER; $pass=$env:FIXED_PASS
           if (net user | Select-String -Pattern "^\s*$user\s*$") { net user $user $pass /Y } else { net user $user $pass /add /Y }
           net localgroup "Remote Desktop Users" $user /add
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
           netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          Write-Host "RDP enabled. Use $user / $pass"
 
       - name: 🔎 MagicDNS & DERP debug
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           $ipv4 = & $exe ip -4
-          $ipv6 = & $exe ip -6
-          $json = & $exe status --json | Out-String | ConvertFrom-Json
-          $region="unknown"
-          if ($json.Self.DERP -and $json.DERPMap.Regions) { $rid=$json.Self.DERP; $reg=$json.DERPMap.Regions.$rid; if ($reg){$region=$reg.RegionName} }
           $fqdn = "bullet.${{ steps.cfg.outputs.tailnet }}.ts.net"
           Write-Host "IPv4: $ipv4"
-          Write-Host "IPv6: $ipv6"
           Write-Host "MagicDNS: $fqdn"
-          Write-Host "DERP region: $region"
 
-      - name: ⏳ Keep alive (RDP window)
+      - name: ⏳ Keep alive
         run: |
-          $mins = [int]"${{ steps.cfg.outputs.runtime }}"; $total=$mins*60
+          $mins=[int]"${{ steps.cfg.outputs.runtime }}"; $total=$mins*60
           for ($i=0; $i -lt $total; $i+=30) { Write-Host "alive $i/$total"; Start-Sleep -Seconds 30 }
 
-      - name: 🧹 PURGE bullet* (end — tolerant)
-        if: always()
-        run: |
-          $headers = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
-          $tn      = "${{ steps.cfg.outputs.tailnet }}"
-          $base    = "https://api.tailscale.com/api/v2"
-          $uri     = "$base/tailnet/$([uri]::EscapeDataString($tn))/devices"
-          try { $resp = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers } catch { Write-Warning "List devices failed: $_"; exit 0 }
-          foreach ($d in $resp.devices) {
-            $name=$d.name; $id=$d.id
-            $isExternal = $false
-            if ($d.PSObject.Properties.Name -contains "isExternal") { $isExternal = [bool]$d.isExternal }
-            if ($name -match '^(?i)bullet(\b|-|_|$)' -and -not $isExternal) {
-              try { Invoke-RestMethod -Method DELETE -Uri "$base/device/$id" -Headers $headers; Write-Host "Deleted $name ($id)" }
-              catch { Write-Warning "Skip deleting $name ($id): $($_.Exception.Response.StatusCode.value__) / $($_.ErrorDetails.Message)" }
-            }
-          }
-
-      - name: 🔁 Dispatch B (no delay; uses PAT if provided)
+      - name: 🔁 Dispatch B
         if: always()
         env:
           TOKEN_INPUT: ${{ steps.cfg.outputs.apitok }}
-          TOKEN_FALLBACK: ${{ env.GH_TOKEN_FALLBACK }}
+          TOKEN_FALLBACK: ${{ env:GH_TOKEN_FALLBACK }}
         run: |
           $token = if ($env:TOKEN_INPUT) { $env:TOKEN_INPUT } else { $env:TOKEN_FALLBACK }
           $body = @{
@@ -187,16 +146,8 @@ jobs:
               TS_TAILNET = "${{ steps.cfg.outputs.tailnet }}"
               TS_API_KEY = "${{ steps.cfg.outputs.apikey }}"
               TS_AUTHKEY = "${{ steps.cfg.outputs.authkey }}"
-              RDP_USER   = "${{ steps.cfg.outputs.rdpuser }}"
-              RDP_PASS   = "${{ steps.cfg.outputs.rdppass }}"
               TEST_MODE  = "${{ steps.cfg.outputs.testmode }}"
               GH_API_TOKEN = $token
             }
           } | ConvertTo-Json -Depth 5
-          $uri = "https://api.github.com/repos/${{ github.repository }}/dispatches"
-          try {
-            Invoke-RestMethod -Method POST -Uri $uri -Headers @{Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
-            Write-Host "Triggered enigmano_b"
-          } catch {
-            Write-Warning "Dispatch B failed (non-fatal): $($_.ErrorDetails.Message)"
-          }
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers @{Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
