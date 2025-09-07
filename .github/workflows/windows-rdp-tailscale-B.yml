@@ -1,6 +1,9 @@
 name: Windows RDP via Tailscale (B)
 
 on:
+  repository_dispatch:
+    types: [enigmano_b]
+
   workflow_run:
     workflows: ["Windows RDP via Tailscale (A)"]
     types: [completed]
@@ -9,25 +12,48 @@ permissions:
   contents: write
   actions: write
 
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
+
 jobs:
   rdp:
     runs-on: windows-2022
     timeout-minutes: 370
 
     steps:
-      - name: 🧾 Read payload
+      - name: 🔧 Read payload
         id: cfg
-        shell: pwsh
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
           $p  = $ev.client_payload
-          "tailnet=$($p.ts_tailnet)"   | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$($p.ts_api_key)"    | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$($p.ts_authkey)"   | Out-File -Append $env:GITHUB_OUTPUT
-          "apitok=$($p.gh_api_token)"  | Out-File -Append $env:GITHUB_OUTPUT
+          if (-not $p) { Write-Error "This workflow should be started by A via repository_dispatch."; exit 1 }
+          $tailnet = $p.ts_tailnet
+          $apiKey  = $p.ts_api_key
+          $authKey = $p.ts_authkey
+          $apiTok  = $p.gh_api_token
+          $runtime = [int]$p.runtime_minutes
+          $loops   = [int]$p.loops
+          $purge   = if ($p.purge_pattern) { $p.purge_pattern } else { '^(?i)bullet(\b|\.|-)' }
 
-      - name: ⚡ Install Tailscale
-        shell: pwsh
+          if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
+          if ($runtime -gt 355) { $runtime = 355 }
+          if ($loops -lt 0) { $loops = 0 }
+
+          "tailnet=$tailnet"         | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apiKey"           | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authKey"         | Out-File -Append $env:GITHUB_OUTPUT
+          "apitok=$apiTok"           | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime"         | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"             | Out-File -Append $env:GITHUB_OUTPUT
+          "purge_pattern=$purge"     | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: ⚙️ Install Tailscale (if missing) & show version
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -37,12 +63,11 @@ jobs:
             Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
-          & $exe version
+          & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: 🔐 Enable RDP user + firewall
-        shell: pwsh
+      - name: 🔐 Enable RDP + user + firewall (fixed creds)
         run: |
-          $u = "Bullettemporary"; $p = "Bullet@12345"
+          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name $u -Password $sec -AccountNeverExpires
@@ -53,76 +78,81 @@ jobs:
             Enable-LocalUser -Name $u
           }
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      - name: 🧹 Purge bullet* devices (startup)
-        shell: pwsh
+      - name: 🧹 Purge devices matching pattern (startup)
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          $pat = "${{ steps.cfg.outputs.purge_pattern }}"
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
-              if ($d.name -match '^(?i)bullet') {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" }
-                catch { }
+              if ($d.name -match $pat) {
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null }
+                catch { Write-Warning "Skip delete $($d.name)" }
               }
             }
-          } catch { }
+          } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: 🔗 Tailscale up
-        shell: pwsh
+      - name: 🔗 Tailscale up (hostname=bullet)
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
-          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname bullet --accept-routes --accept-dns=false
-          $ip4 = & $ts ip -4 | Select-Object -First 1
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+          $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
-          "### RDP CONNECT (B)`nHost: bullet`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: Bullettemporary`nPass: Bullet@12345" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "### RDP CONNECT (B)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: ⏳ Keep alive ~6h
-        shell: pwsh
+      - name: ⏳ Keep alive
         run: |
-          $mins = 355
-          $endAt = (Get-Date).AddMinutes($mins)
-          while ((Get-Date) -lt $endAt) {
-            $left = [int]([math]::Ceiling(($endAt - (Get-Date)).TotalMinutes))
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Alive ($left min left)"
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          $end  = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            $left = [int]([math]::Ceiling(($end - (Get-Date)).TotalMinutes))
+            Write-Host "RDP alive... ($left min left)"
             Start-Sleep -Seconds 60
           }
 
-      - name: 🧹 Purge bullet* devices (exit)
+      - name: 🧹 Purge devices (exit)
         if: always()
-        shell: pwsh
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          $pat = "${{ steps.cfg.outputs.purge_pattern }}"
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
-              if ($d.name -match '^(?i)bullet') {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" }
-                catch { }
+              if ($d.name -match $pat) {
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null } catch {}
               }
             }
-          } catch { }
+          } catch { Write-Warning "Exit purge failed: $_" }
 
-      - name: 🔁 Dispatch partner (A)
+      - name: 🔁 Dispatch A (or stop if loops finished)
         if: always()
-        shell: pwsh
+        env:
+          GH_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $token = "${{ steps.cfg.outputs.apitok }}"
+          $loops = [int]"${{ steps.cfg.outputs.loops }}"
+          if ($loops -gt 0) { $nextLoops = $loops - 1 } else { $nextLoops = 0 }  # 0 = infinite
+          if ($loops -eq 1) {
+            Write-Host "Loops finished; not dispatching A."
+            exit 0
+          }
+          $token = if ("${{ steps.cfg.outputs.apitok }}") { "${{ steps.cfg.outputs.apitok }}" } else { "$env:GH_FALLBACK" }
           $body = @{
             event_type = "enigmano_a"
             client_payload = @{
-              ts_tailnet   = "${{ steps.cfg.outputs.tailnet }}"
-              ts_api_key   = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey   = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token = $token
+              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
+              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
+              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
+              gh_api_token    = $token
+              test_mode       = $false
+              runtime_minutes = [int]"${{ steps.cfg.outputs.runtime }}"
+              loops           = $nextLoops
+              purge_pattern   = "${{ steps.cfg.outputs.purge_pattern }}"
             }
-          } | ConvertTo-Json -Depth 4
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
+          } | ConvertTo-Json -Depth 5
+          Invoke-RestMethod -Method POST -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" -Headers @{ Authorization="Bearer $token"; "Accept"="application/vnd.github+json"} -Body $body
