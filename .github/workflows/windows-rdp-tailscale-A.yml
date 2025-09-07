@@ -13,8 +13,8 @@ on:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
       gh_api_token:
-        description: "(Optional) GitHub PAT; blank = use default GITHUB_TOKEN"
-        required: false
+        description: "GitHub Personal Access Token (classic) with scopes: repo, workflow (REQUIRED)"
+        required: true
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
@@ -59,21 +59,21 @@ jobs:
           $loops   = [int]$ev.inputs.loops
 
           if (-not $tailnet -or -not $apiKey -or -not $authKey) {
-            Write-Error "Missing required inputs (tailnet / api_key / authkey)."
-            exit 1
+            Write-Error "Missing required inputs (tailnet / api_key / authkey)."; exit 1
           }
+          if (-not $apiTok) { Write-Error "gh_api_token (PAT with repo+workflow) is REQUIRED."; exit 1 }
 
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
           if ($runtime -gt 355) { $runtime = 355 }
           if ($loops -lt 0) { $loops = 0 } # 0 = infinite
 
-          "tailnet=$tailnet"     | Out-File -Append $env:GITHUB_OUTPUT
-          "apikey=$apiKey"       | Out-File -Append $env:GITHUB_OUTPUT
-          "authkey=$authKey"     | Out-File -Append $env:GITHUB_OUTPUT
-          "apitok=$apiTok"       | Out-File -Append $env:GITHUB_OUTPUT
-          "runtime=$runtime"     | Out-File -Append $env:GITHUB_OUTPUT
-          "loops=$loops"         | Out-File -Append $env:GITHUB_OUTPUT
+          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
+          "apitok=$apiTok"   | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
 
       - name: ⚙️ Install Tailscale (if missing) & version
         run: |
@@ -127,6 +127,78 @@ jobs:
           $fqdn = $status.Self.DNSName
           "### RDP CONNECT (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
+      - name: 🧰 Uninstall + Install apps and create Desktop shortcuts
+        run: |
+          $ErrorActionPreference = "Continue"
+          function Wing { param($args) winget $args --silent --accept-source-agreements --accept-package-agreements | Out-Host }
+          function Add-Shortcut($Name,$Target,$Args="",$Icon="") {
+            try {
+              $Desktop = [Environment]::GetFolderPath("Desktop")
+              $Path = Join-Path $Desktop "$Name.lnk"
+              $Wsh = New-Object -ComObject WScript.Shell
+              $Shortcut = $Wsh.CreateShortcut($Path)
+              $Shortcut.TargetPath = $Target
+              if ($Args)  { $Shortcut.Arguments  = $Args }
+              if ($Icon)  { $Shortcut.IconLocation = $Icon }
+              $Shortcut.WorkingDirectory = Split-Path $Target -Parent
+              $Shortcut.Save()
+              Write-Host "Shortcut added: $Name"
+            } catch { Write-Warning "Shortcut failed for $Name : $_" }
+          }
+          function Add-WebShortcut($Name,$Url){
+            try{
+              $Desktop = [Environment]::GetFolderPath("Desktop")
+              $Path = Join-Path $Desktop "$Name.url"
+              @"
+[InternetShortcut]
+URL=$Url
+IconFile=%SystemRoot%\system32\url.dll
+IconIndex=0
+"@ | Out-File -Encoding ascii $Path
+              Write-Host "Web shortcut added: $Name"
+            } catch { Write-Warning "Web shortcut failed $Name : $_" }
+          }
+
+          # Uninstall unwanted
+          Wing uninstall --id EpicGames.EpicGamesLauncher
+          Wing uninstall --id RProject.R --version 4.4.2
+          Wing uninstall --id UnityTechnologies.UnityHub
+
+          # Install browsers / tools
+          Wing install --id Mozilla.Firefox.DeveloperEdition
+          Wing install --id Brave.Brave
+          Wing install --id VivaldiTechnologies.Vivaldi
+          Wing install --id Opera.OperaGX
+          Wing install --id WhatsApp.WhatsApp
+          Wing install --id Telegram.TelegramDesktop
+          Wing install --id VideoLAN.VLC
+          Wing install --id Ookla.Speedtest
+          Wing install --id ProtonVPN.ProtonVPN
+          Wing install --id Microsoft.BingWallpaper
+          # OneDrive normally present; ensure up to date
+          Wing install --id Microsoft.OneDrive
+
+          # Paths (best-effort)
+          $paths = @{
+            "Firefox Developer Edition" = "C:\Program Files\Firefox Developer Edition\firefox.exe"
+            "Brave Browser"             = "C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+            "Vivaldi"                   = "C:\Program Files\Vivaldi\Application\vivaldi.exe"
+            "Opera GX"                  = "$env:LOCALAPPDATA\Programs\Opera GX\launcher.exe"
+            "WhatsApp"                  = "$env:LOCALAPPDATA\Microsoft\WindowsApps\WhatsApp.exe"
+            "Telegram"                  = "$env:APPDATA\Telegram Desktop\Telegram.exe"
+            "VLC media player"          = "C:\Program Files\VideoLAN\VLC\vlc.exe"
+            "Speedtest"                 = "C:\Program Files\Ookla\Speedtest\speedtest.exe"
+            "Proton VPN"                = "C:\Program Files\Proton\VPN\Proton VPN.exe"
+            "OneDrive"                  = "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe"
+          }
+          foreach ($k in $paths.Keys) {
+            $p = [Environment]::ExpandEnvironmentVariables($paths[$k])
+            if (Test-Path $p) { Add-Shortcut -Name $k -Target $p }
+          }
+          # Web shortcuts for services without reliable EXE
+          Add-WebShortcut -Name "ChatGPT" -Url "https://chat.openai.com/"
+          Add-WebShortcut -Name "Instagram" -Url "https://www.instagram.com/"
+
       - name: ⏳ Keep alive
         run: |
           $mins = [int]"${{ steps.cfg.outputs.runtime }}"
@@ -152,15 +224,13 @@ jobs:
             }
           } catch { Write-Warning "Exit purge failed: $_" }
 
-      - name: 🔁 Dispatch workflow B (no delay)
+      - name: 🔁 Dispatch workflow B (no delay; requires PAT)
         if: always()
-        env:
-          GH_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $loops = [int]"${{ steps.cfg.outputs.loops }}"
           if ($loops -gt 0) { $nextLoops = $loops - 1 } else { $nextLoops = 0 }  # 0 = infinite
           if ($loops -eq 1) { Write-Host "Loops finished; not dispatching B."; exit 0 }
-          $token = if ("${{ steps.cfg.outputs.apitok }}") { "${{ steps.cfg.outputs.apitok }}" } else { "$env:GH_FALLBACK" }
+          $token = "${{ steps.cfg.outputs.apitok }}"
           $body  = @{
             ref    = "${{ github.ref_name }}"
             inputs = @{
