@@ -1,4 +1,4 @@
-name: "⚡ EnigMano A (Tailscale bullet • RDP • auto-loop)"
+name: "⚡ EnigMano A (Cloud • Tailscale bullet • RDP • auto-loop)"
 
 on:
   workflow_dispatch:
@@ -7,10 +7,10 @@ on:
         description: "Tailscale tailnet (you@gmail.com or company.com)"
         required: true
       TS_API_KEY:
-        description: "Tailscale API key (device admin)"
+        description: "Tailscale API key (device admin) — for cleanup"
         required: true
       TS_AUTHKEY:
-        description: "Tailscale auth key (reusable/ephemeral)"
+        description: "Tailscale auth key (reusable/ephemeral) — for tailscale up"
         required: true
       TEST_MODE:
         description: "Run 5-minute test mode?"
@@ -18,7 +18,7 @@ on:
         required: true
         default: false
       GH_API_TOKEN:
-        description: "(Optional) PAT for GitHub dispatch; leave blank to use default GITHUB_TOKEN"
+        description: "(Optional) GitHub PAT for repository_dispatch; leave blank to use default GITHUB_TOKEN"
         required: false
 
   repository_dispatch:
@@ -34,7 +34,7 @@ defaults:
 
 jobs:
   rdp:
-    name: "🚀 A: EnigMano bullet"
+    name: "🚀 A: EnigMano bullet (Cloud)"
     runs-on: windows-2022
     timeout-minutes: 480
 
@@ -99,9 +99,11 @@ jobs:
             }
           }
 
-      - name: ⚙️ Install Tailscale
+      - name: ⚙️ Install Tailscale (if missing)
         run: |
-          choco install tailscale -y --no-progress
+          if (-not (Test-Path "C:\Program Files\Tailscale\tailscale.exe")) {
+            choco install tailscale -y --no-progress
+          }
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
       - name: 🔗 tailscale up (hostname=bullet)
@@ -113,7 +115,7 @@ jobs:
 
       - name: 🧰 Enable RDP (fixed user/pass)
         run: |
-          $user=$env:FIXED_USER; $pass=$env:FIXED_PASS
+          $user="${{ env.FIXED_USER }}"; $pass="${{ env.FIXED_PASS }}"
           if (net user | Select-String -Pattern "^\s*$user\s*$") { net user $user $pass /Y } else { net user $user $pass /add /Y }
           net localgroup "Remote Desktop Users" $user /add
           reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fDenyTSConnections /t REG_DWORD /d 0 /f | Out-Null
