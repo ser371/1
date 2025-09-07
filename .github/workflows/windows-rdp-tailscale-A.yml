@@ -1,0 +1,162 @@
+name: Windows RDP via Tailscale (A)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:
+        description: "Tailscale tailnet (e.g., you@gmail.com or company.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key (device admin) — DO NOT prefix with 'Bearer'"
+        required: true
+      ts_authkey:
+        description: "Tailscale auth key (reusable or ephemeral)"
+        required: true
+      gh_api_token:
+        description: "(Optional) GitHub PAT to dispatch partner workflow (A↔B loop)"
+        required: false
+      test_mode:
+        description: "Run a short 10-minute test instead of ~6 hours"
+        type: boolean
+        default: false
+
+  repository_dispatch:
+    types: [enigmano_a]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: rdp-tailscale-chain
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  TS_HOSTNAME: bullet
+  PARTNER_FILE: windows-rdp-tailscale-B.yml
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 370
+
+    env:
+      RAW_EVENT: ${{ toJson(github.event) }}
+
+    steps:
+      - name: Resolve inputs (workflow_dispatch vs repository_dispatch)
+        id: cfg
+        run: |
+          $ev = ConvertFrom-Json -InputObject $env:RAW_EVENT
+          $isRepoDispatch = $ev.event_type -eq "enigmano_a"
+          if ($isRepoDispatch) {
+            $p = $ev.client_payload
+            $tailnet = $p.ts_tailnet
+            $apiKey  = $p.ts_api_key
+            $authKey = $p.ts_authkey
+            $test    = [bool]$p.test_mode
+            $apiTok  = $p.gh_api_token
+          } else {
+            $tailnet = "${{ github.event.inputs.ts_tailnet }}"
+            $apiKey  = "${{ github.event.inputs.ts_api_key }}"
+            $authKey = "${{ github.event.inputs.ts_authkey }}"
+            $test    = ("${{ github.event.inputs.test_mode }}" -eq "true")
+            $apiTok  = "${{ github.event.inputs.gh_api_token }}"
+          }
+
+          if (-not $tailnet -or -not $apiKey -or -not $authKey) {
+            Write-Error "Missing required inputs."
+            exit 1
+          }
+
+          $runtime = if ($test) { 10 } else { 355 }
+          "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
+          "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
+          "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
+          "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "testmode=$test"   | Out-File -Append $env:GITHUB_OUTPUT
+          "apitok=$apiTok"   | Out-File -Append $env:GITHUB_OUTPUT
+
+      - name: Install Tailscale
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      - name: Enable RDP (fixed user/pass)
+        run: |
+          $u = "${{ env.RDP_USER }}"
+          $p = "${{ env.RDP_PASS }}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires -PasswordNeverExpires:$true
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires:$true
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: Purge bullet* devices
+        run: |
+          $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
+          $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
+          $url = "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri $url
+            foreach ($d in $resp.devices) {
+              $names = @($d.name,$d.hostname)
+              if ($names -match '^(?i)bullet') {
+                try {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id)
+                  Write-Host "Deleted: $($d.name)"
+                } catch { Write-Warning "Skip delete $($d.name)" }
+              }
+            }
+          } catch { Write-Warning "Purge failed: $_" }
+
+      - name: Tailscale up
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
+          $ipv4 = (& $ts ip -4 | Select-Object -First 1)
+          $status = & $ts status --json | ConvertFrom-Json
+          $fqdn = $status.Self.DNSName
+          "### RDP CONNECT (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ipv4`nDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep alive then dispatch B
+        env:
+          GH_FALLBACK: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $mins = [int]"${{ steps.cfg.outputs.runtime }}"
+          Start-Sleep -Seconds ($mins * 60)
+          $token = if ("${{ steps.cfg.outputs.apitok }}") { "${{ steps.cfg.outputs.apitok }}" } else { "$env:GH_FALLBACK" }
+          $body = @{
+            event_type = "enigmano_b"
+            client_payload = @{
+              ts_tailnet   = "${{ steps.cfg.outputs.tailnet }}"
+              ts_api_key   = "${{ steps.cfg.outputs.apikey }}"
+              ts_authkey   = "${{ steps.cfg.outputs.authkey }}"
+              test_mode    = "${{ steps.cfg.outputs.testmode }}"
+              gh_api_token = $token
+            }
+          } | ConvertTo-Json -Depth 4
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
+            -Body $body
