@@ -28,7 +28,6 @@ on:
         required: false
         default: "0"
 
-# One-at-a-time across A & B; the next starts when the previous ends
 concurrency:
   group: tailscale-rdp-singleton
   cancel-in-progress: false
@@ -52,38 +51,42 @@ jobs:
     steps:
       - name: 🔧 Resolve inputs
         id: cfg
-        shell: pwsh
+        env:
+          IN_TAILNET: ${{ inputs.ts_tailnet }}
+          IN_APIKEY: ${{ inputs.ts_api_key }}
+          IN_AUTHKEY: ${{ inputs.ts_authkey }}
+          IN_PAT: ${{ inputs.gh_api_token }}
+          IN_TEST: ${{ inputs.test_mode }}
+          IN_RUNTIME: ${{ inputs.runtime_minutes }}
+          IN_LOOPS: ${{ inputs.loops }}
         run: |
-          $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
-          $i  = $ev.inputs
-
           function To-Bool($v) {
             if ($null -eq $v) { return $false }
             $s = "$v".Trim().ToLower()
-            return ($s -eq 'true' -or $s -eq '1' -or $s -eq 'yes')
+            return ($s -eq 'true' -or $s -eq '1' -or $s -eq 'yes' -or $s -eq 'on')
           }
           function To-IntOr($v, $default) {
             if ($null -ne $v -and "$v" -match '^\d+$') { return [int]$v }
             return [int]$default
           }
 
-          $tailnet = $i.ts_tailnet
-          $apiKey  = $i.ts_api_key
-          $authKey = $i.ts_authkey
-          $pat     = $i.gh_api_token
+          $tailnet = $env:IN_TAILNET
+          $apiKey  = $env:IN_APIKEY
+          $authKey = $env:IN_AUTHKEY
+          $pat     = $env:IN_PAT
 
           if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
             Write-Error "Missing required inputs"; exit 1
           }
 
-          $test    = To-Bool $i.test_mode
-          $runtime = To-IntOr $i.runtime_minutes 355
+          $test    = To-Bool $env:IN_TEST
+          $runtime = To-IntOr $env:IN_RUNTIME 355
           if ($test) { $runtime = 5 }
           if ($runtime -gt 360) { $runtime = 355 }
-          if ($runtime -lt 1)   { $runtime = 5 }   # safety floor
+          if ($runtime -lt 1)   { $runtime = 5 }
 
-          $loops   = To-IntOr $i.loops 0
-          if ($loops -lt 0) { $loops = 0 }  # 0 = infinite
+          $loops   = To-IntOr $env:IN_LOOPS 0
+          if ($loops -lt 0) { $loops = 0 }
 
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
