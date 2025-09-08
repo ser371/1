@@ -12,9 +12,6 @@ on:
       ts_authkey:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
-      gh_api_token:
-        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
-        required: true
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
@@ -23,14 +20,14 @@ on:
         description: "Runtime in minutes (max 360; capped to 355)"
         required: false
         default: "355"
-      loops:
-        description: "How many loops (0 = infinite)"
-        required: false
-        default: "0"
+
+# Ensure only ONE run at a time across A and B
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 defaults:
   run:
@@ -46,36 +43,26 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      - name: Eva Angelina 
+      - name: 🔧 Resolve inputs
         id: cfg
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
-          $i = $ev.inputs
-
+          $i  = $ev.inputs
           $tailnet = $i.ts_tailnet
           $apiKey  = $i.ts_api_key
           $authKey = $i.ts_authkey
-          $apiTok  = $i.gh_api_token
           $test    = [bool]$i.test_mode
           $runtime = [int]$i.runtime_minutes
-          $loops   = [int]$i.loops
-
-          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $apiTok) {
-            Write-Error "Missing required inputs"; exit 1
-          }
+          if (-not $tailnet -or -not $apiKey -or -not $authKey) { Write-Error "Missing required inputs"; exit 1 }
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
           if ($runtime -gt 355) { $runtime = 355 }
-          if ($loops -lt 0) { $loops = 0 }
-
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
           "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
-          "apitok=$apiTok"   | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
-          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: Lana Rhoades
+      - name: ⚙️ Install Tailscale (if missing) & show version
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -87,7 +74,7 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: Angela White
+      - name: 🔐 Enable RDP user + firewall
         run: |
           $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
@@ -102,7 +89,7 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      - name: Eva Elfie
+      - name: 🧹 PURGE any devices containing 'bullet' (startup)
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
@@ -118,14 +105,12 @@ jobs:
                 try {
                   Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
                   Write-Host "Deleted at start: $($d.name)"
-                } catch {
-                  Write-Warning "Delete failed for $($d.name): $_"
-                }
+                } catch { Write-Warning "Delete failed for $($d.name): $_" }
               }
             }
           } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: Mia Malkova
+      - name: 🔗 Tailscale up (hostname=bullet)
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
@@ -136,7 +121,7 @@ jobs:
           $fqdn = $status.Self.DNSName
           "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Emily Willis
+      - name: ⏳ Keep alive
         run: |
           $mins=[int]"${{ steps.cfg.outputs.runtime }}"
           $end=(Get-Date).AddMinutes($mins)
@@ -146,7 +131,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: Mia Khalifa
+      - name: 🧹 PURGE any devices containing 'bullet' (exit)
         if: always()
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
@@ -167,29 +152,3 @@ jobs:
               }
             }
           } catch { Write-Warning "Exit purge failed: $_" }
-
-      - name: Lena Paul
-        if: always()
-        run: |
-          $loops=[int]"${{ steps.cfg.outputs.loops }}"
-          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching B."; exit 0 }
-          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
-
-          $token="${{ steps.cfg.outputs.apitok }}"
-          $body=@{
-            ref    = "${{ github.ref_name }}"
-            inputs = @{
-              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
-              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
-              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
-              gh_api_token    = "$token"
-              test_mode       = "false"
-              runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
-              loops           = "$next"
-            }
-          } | ConvertTo-Json -Depth 5
-
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
