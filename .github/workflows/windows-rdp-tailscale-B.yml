@@ -28,7 +28,7 @@ on:
         required: false
         default: "0"
 
-# One-at-a-time across A & B; next run starts as soon as previous ends
+# One-at-a-time across A & B; the next starts when the previous ends
 concurrency:
   group: tailscale-rdp-singleton
   cancel-in-progress: false
@@ -52,23 +52,38 @@ jobs:
     steps:
       - name: 🔧 Resolve inputs
         id: cfg
+        shell: pwsh
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
           $i  = $ev.inputs
+
+          function To-Bool($v) {
+            if ($null -eq $v) { return $false }
+            $s = "$v".Trim().ToLower()
+            return ($s -eq 'true' -or $s -eq '1' -or $s -eq 'yes')
+          }
+          function To-IntOr($v, $default) {
+            if ($null -ne $v -and "$v" -match '^\d+$') { return [int]$v }
+            return [int]$default
+          }
 
           $tailnet = $i.ts_tailnet
           $apiKey  = $i.ts_api_key
           $authKey = $i.ts_authkey
           $pat     = $i.gh_api_token
-          $test    = [bool]$i.test_mode
-          $runtime = [int]$i.runtime_minutes
-          $loops   = [int]$i.loops
 
-          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) { Write-Error "Missing required inputs"; exit 1 }
+          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
+            Write-Error "Missing required inputs"; exit 1
+          }
+
+          $test    = To-Bool $i.test_mode
+          $runtime = To-IntOr $i.runtime_minutes 355
           if ($test) { $runtime = 5 }
-          if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
-          if ($runtime -gt 355) { $runtime = 355 }
-          if ($loops -lt 0) { $loops = 0 } # 0 = infinite
+          if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -lt 1)   { $runtime = 5 }
+
+          $loops   = To-IntOr $i.loops 0
+          if ($loops -lt 0) { $loops = 0 }
 
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
