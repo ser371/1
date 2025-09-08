@@ -12,6 +12,9 @@ on:
       ts_authkey:
         description: "Tailscale auth key (reusable or ephemeral)"
         required: true
+      gh_api_token:
+        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
+        required: true
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
@@ -20,8 +23,12 @@ on:
         description: "Runtime in minutes (max 360; capped to 355)"
         required: false
         default: "355"
+      loops:
+        description: "How many handoffs (0 = infinite)"
+        required: false
+        default: "0"
 
-# Ensure only ONE run at a time across A and B
+# One-at-a-time across A & B; next run starts as soon as previous ends
 concurrency:
   group: tailscale-rdp-singleton
   cancel-in-progress: false
@@ -48,19 +55,27 @@ jobs:
         run: |
           $ev = ConvertFrom-Json '${{ toJson(github.event) }}'
           $i  = $ev.inputs
+
           $tailnet = $i.ts_tailnet
           $apiKey  = $i.ts_api_key
           $authKey = $i.ts_authkey
+          $pat     = $i.gh_api_token
           $test    = [bool]$i.test_mode
           $runtime = [int]$i.runtime_minutes
-          if (-not $tailnet -or -not $apiKey -or -not $authKey) { Write-Error "Missing required inputs"; exit 1 }
+          $loops   = [int]$i.loops
+
+          if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) { Write-Error "Missing required inputs"; exit 1 }
           if ($test) { $runtime = 5 }
           if (-not $runtime -or $runtime -gt 360) { $runtime = 355 }
           if ($runtime -gt 355) { $runtime = 355 }
+          if ($loops -lt 0) { $loops = 0 } # 0 = infinite
+
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
           "apikey=$apiKey"   | Out-File -Append $env:GITHUB_OUTPUT
           "authkey=$authKey" | Out-File -Append $env:GITHUB_OUTPUT
+          "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
+          "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
 
       - name: ⚙️ Install Tailscale (if missing) & show version
         run: |
@@ -94,18 +109,13 @@ jobs:
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
           $match = { param($d)
-            ($d.name -match '(?i)bullet') -or
-            ($d.hostname -match '(?i)bullet') -or
-            ($d.DNSName -match '(?i)bullet')
+            ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet')
           }
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if (& $match $d) {
-                try {
-                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
-                  Write-Host "Deleted at start: $($d.name)"
-                } catch { Write-Warning "Delete failed for $($d.name): $_" }
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null; Write-Host "Deleted at start: $($d.name)" } catch {}
               }
             }
           } catch { Write-Warning "Startup purge failed: $_" }
@@ -137,18 +147,39 @@ jobs:
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
           $match = { param($d)
-            ($d.name -match '(?i)bullet') -or
-            ($d.hostname -match '(?i)bullet') -or
-            ($d.DNSName -match '(?i)bullet')
+            ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet')
           }
           try {
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if (& $match $d) {
-                try {
-                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
-                  Write-Host "Deleted at exit: $($d.name)"
-                } catch { Write-Warning "Delete failed for $($d.name): $_" }
+                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null; Write-Host "Deleted at exit: $($d.name)" } catch {}
               }
             }
           } catch { Write-Warning "Exit purge failed: $_" }
+
+      - name: 🔁 Dispatch workflow A (instant, forever by default)
+        if: always()
+        run: |
+          $loops=[int]"${{ steps.cfg.outputs.loops }}"
+          if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
+          if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
+
+          $token="${{ steps.cfg.outputs.pat }}"
+          $body=@{
+            ref    = "${{ github.ref_name }}"
+            inputs = @{
+              ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
+              ts_api_key      = "${{ steps.cfg.outputs.apikey }}"
+              ts_authkey      = "${{ steps.cfg.outputs.authkey }}"
+              gh_api_token    = "$token"
+              test_mode       = "false"
+              runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
+              loops           = "$next"
+            }
+          } | ConvertTo-Json -Depth 5
+
+          Invoke-RestMethod -Method POST `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" `
+            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
+            -Body $body
