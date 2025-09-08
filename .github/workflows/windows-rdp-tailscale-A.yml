@@ -34,6 +34,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write
 
 defaults:
   run:
@@ -56,7 +57,7 @@ jobs:
           RAW_APIKEY:   ${{ inputs.ts_api_key }}
           RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
           RAW_PAT:      ${{ inputs.gh_api_token }}
-          RAW_TEST:     ${{ inputs.test_mode && 'true' || 'false' }}
+          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
           RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
           RAW_LOOPS:    ${{ inputs.loops || '0' }}
         run: |
@@ -70,11 +71,15 @@ jobs:
             Write-Error "Missing required inputs"; exit 1
           }
 
-          $isTest  = ($env:RAW_TEST -eq 'true')
+          # Robust boolean
+          $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
+
           $runtime = ToIntOr $env:RAW_RUNTIME 355
           if ($isTest) { $runtime = 5 }
+
+          # Ensure ~6h (355) when test_mode is off and value is too small
+          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
-          if ($runtime -lt 1)   { $runtime = 5 }
 
           $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
@@ -125,21 +130,31 @@ jobs:
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if (& $match $d) {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null; Write-Host "Deleted at start: $($d.name)" } catch {}
+                try {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                  Write-Host "Deleted at start: $($d.name)"
+                } catch {}
               }
             }
           } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: 🔗 Tailscale up (hostname=bullet)
+      - name: 🔗 Tailscale up (hostname=bullet) + show IP/FQDN/DERP
+        id: up
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
           & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
           Start-Sleep -Seconds 2
+
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
-          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $derp = $status.Self.DERP
+          "ip4=$ip4"   | Out-File -Append $env:GITHUB_OUTPUT
+          "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
+          "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
+
+          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: ⏳ Keep alive
         run: |
@@ -163,7 +178,10 @@ jobs:
             $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices"
             foreach ($d in $resp.devices) {
               if (& $match $d) {
-                try { Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null; Write-Host "Deleted at exit: $($d.name)" } catch {}
+                try {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                  Write-Host "Deleted at exit: $($d.name)"
+                } catch {}
               }
             }
           } catch { Write-Warning "Exit purge failed: $_" }
