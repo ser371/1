@@ -49,43 +49,34 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      - name: 🔧 Resolve inputs
+      - name: 🔧 Resolve inputs (safe)
         id: cfg
         env:
-          IN_TAILNET: ${{ inputs.ts_tailnet }}
-          IN_APIKEY: ${{ inputs.ts_api_key }}
-          IN_AUTHKEY: ${{ inputs.ts_authkey }}
-          IN_PAT: ${{ inputs.gh_api_token }}
-          IN_TEST: ${{ inputs.test_mode }}
-          IN_RUNTIME: ${{ inputs.runtime_minutes }}
-          IN_LOOPS: ${{ inputs.loops }}
+          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
+          RAW_APIKEY:   ${{ inputs.ts_api_key }}
+          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+          RAW_PAT:      ${{ inputs.gh_api_token }}
+          RAW_TEST:     ${{ inputs.test_mode && 'true' || 'false' }}
+          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:    ${{ inputs.loops || '0' }}
         run: |
-          function To-Bool($v) {
-            if ($null -eq $v) { return $false }
-            $s = "$v".Trim().ToLower()
-            return ($s -eq 'true' -or $s -eq '1' -or $s -eq 'yes' -or $s -eq 'on')
-          }
-          function To-IntOr($v, $default) {
-            if ($null -ne $v -and "$v" -match '^\d+$') { return [int]$v }
-            return [int]$default
-          }
+          function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
 
-          $tailnet = $env:IN_TAILNET
-          $apiKey  = $env:IN_APIKEY
-          $authKey = $env:IN_AUTHKEY
-          $pat     = $env:IN_PAT
-
+          $tailnet = $env:RAW_TAILNET
+          $apiKey  = $env:RAW_APIKEY
+          $authKey = $env:RAW_AUTHKEY
+          $pat     = $env:RAW_PAT
           if (-not $tailnet -or -not $apiKey -or -not $authKey -or -not $pat) {
             Write-Error "Missing required inputs"; exit 1
           }
 
-          $test    = To-Bool $env:IN_TEST
-          $runtime = To-IntOr $env:IN_RUNTIME 355
-          if ($test) { $runtime = 5 }
+          $isTest  = ($env:RAW_TEST -eq 'true')
+          $runtime = ToIntOr $env:RAW_RUNTIME 355
+          if ($isTest) { $runtime = 5 }
           if ($runtime -gt 360) { $runtime = 355 }
           if ($runtime -lt 1)   { $runtime = 5 }
 
-          $loops   = To-IntOr $env:IN_LOOPS 0
+          $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
 
           "tailnet=$tailnet" | Out-File -Append $env:GITHUB_OUTPUT
@@ -94,6 +85,7 @@ jobs:
           "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
 
       - name: ⚙️ Install Tailscale (if missing) & show version
         run: |
