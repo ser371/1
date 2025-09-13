@@ -1,9 +1,9 @@
-name: RDP via Tailscale (A → B, Win2025 + screenshots + data handoff + Telegram)
+name: RDP via Tailscale (A → B, Win2025 + screenshots + data handoff + Telegram, <=10 inputs)
 
 on:
   workflow_dispatch:
     inputs:
-      # --- Tailscale / RDP ---
+      # --- Core (6) ---
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
       ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
@@ -11,38 +11,31 @@ on:
         description: "Run 5-minute test"
         type: boolean
         default: false
-      runtime_minutes:   { description: "Runtime (max 360, capped 355)", required: false, default: "355" }
-      purge_bullet:      { description: "Purge devices containing 'bullet' at start/end", required: false, default: "true" }
+      runtime_minutes:   { description: "Runtime (max 360; capped 355)", required: false, default: "355" }
+      purge_bullet:      { description: "Purge 'bullet' devices at start/end", required: false, default: "true" }
 
-      # --- Cross-account dispatch target: GitHub Account 2 / Repo B ---
-      b_owner:           { description: "Owner/org of Repo B", required: true }
-      b_repo:            { description: "Repo name for B (no owner)", required: true }
-      b_workflow:        { description: "Workflow filename in Repo B (e.g. rdp-tailscale-B.yml)", required: true }
-      b_ref:             { description: "Ref/branch to run B on (e.g. main)", required: true }
-      b_pat:             { description: "PAT from Account 2 with repo+workflow scopes", required: true }
-
-      # --- Shared transfer repo (optional, for A⇄B data loop) ---
-      x_owner:           { description: "Transfer repo owner/org (shared)", required: false, default: "" }
-      x_repo:            { description: "Transfer repo name (no owner)", required: false, default: "" }
-      x_pat:             { description: "PAT that can read/write transfer repo", required: false, default: "" }
-      x_tag:             { description: "Release tag (e.g. pingpong-handoff)", required: false, default: "pingpong-handoff" }
-
-      # --- Telegram (notifications & hourly reminders) ---
-      tg_enable:
-        description: "Enable Telegram notifications"
-        type: boolean
-        default: false
-      tg_bot_token:
-        description: "Telegram Bot API token"
+      # --- Packed JSON inputs (3) ---
+      b_json:
+        description: >-
+          JSON for Repo B dispatch:
+          {"owner":"ACCOUNT2","repo":"REPO_B","workflow":"rdp-tailscale-B.yml","ref":"main","pat":"<B_PAT>"}
+        required: true
+        default: ""
+      xfer_json:
+        description: >-
+          (optional) JSON transfer repo:
+          {"owner":"ACCOUNT2","repo":"rdp-transfer","tag":"pingpong-handoff","pat":"<XFER_PAT>"}
         required: false
         default: ""
-      tg_chat_id:
-        description: "Telegram chat ID (user or group)"
+      tg_json:
+        description: >-
+          (optional) JSON telegram:
+          {"enable":true,"bot_token":"<TOKEN>","chat_id":"<CHAT_ID>"}
         required: false
         default: ""
 
-      # --- Ping-pong control ---
-      cycles:            { description: "0=infinite, N=total remaining handoffs incl. this run", required: false, default: "0" }
+      # --- Ping-pong control (1) ---
+      cycles:            { description: "0=infinite; N=remaining handoffs incl. this run", required: false, default: "0" }
 
 permissions:
   contents: read
@@ -76,20 +69,68 @@ jobs:
           function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
           $log = New-Object System.Text.StringBuilder
           function Log($s){ $null = $log.AppendLine($s); Write-Host $s }
+
+          # ---------- Parse packed JSON inputs safely ----------
+          $BRAW = @'${{ inputs.b_json }}'@
+          $XRAW = @'${{ inputs.xfer_json }}'@
+          $TRAW = @'${{ inputs.tg_json }}'@
+
+          $b = if (-not [string]::IsNullOrWhiteSpace($BRAW)) { $BRAW | ConvertFrom-Json } else { $null }
+          $x = if (-not [string]::IsNullOrWhiteSpace($XRAW)) { $XRAW | ConvertFrom-Json } else { $null }
+          $t = if (-not [string]::IsNullOrWhiteSpace($TRAW)) { $TRAW | ConvertFrom-Json } else { $null }
+
+          if (-not $b -or -not $b.owner -or -not $b.repo -or -not $b.workflow -or -not $b.ref -or -not $b.pat) {
+            Write-Error "b_json is missing required fields (owner, repo, workflow, ref, pat)."; exit 1
+          }
+
+          $bOwner    = $b.owner
+          $bRepo     = $b.repo
+          $bWorkflow = $b.workflow
+          $bRef      = $b.ref
+          $bPAT      = $b.pat
+
+          $xOwner = if ($x) { $x.owner } else { "" }
+          $xRepo  = if ($x) { $x.repo }  else { "" }
+          $xTag   = if ($x -and $x.tag) { $x.tag } else { "pingpong-handoff" }
+          $xPAT   = if ($x) { $x.pat }   else { "" }
+
+          $tgEnabled = if ($t -and $t.enable) { [bool]$t.enable } else { $false }
+          $tgToken   = if ($t) { $t.bot_token } else { "" }
+          $tgChat    = if ($t) { $t.chat_id }   else { "" }
+
           function TgSend([string]$text){
-            if(-not (Yes("${{ inputs.tg_enable }}"))) { return }
-            $token = "${{ inputs.tg_bot_token }}"; $chat = "${{ inputs.tg_chat_id }}"
-            if([string]::IsNullOrWhiteSpace($token) -or [string]::IsNullOrWhiteSpace($chat)){ return }
-            # Split into 3900-char chunks to stay below Telegram 4096 limit
+            if(-not $tgEnabled){ return }
+            if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
+            # Send in chunks <4096 chars
             for($i=0; $i -lt $text.Length; $i+=3900){
               $chunk = $text.Substring($i, [Math]::Min(3900, $text.Length - $i))
               try{
-                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$token/sendMessage" `
+                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
                   -ContentType "application/x-www-form-urlencoded" `
-                  -Body @{chat_id=$chat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
+                  -Body @{chat_id=$tgChat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
               }catch{ Write-Warning "Telegram send failed: $_" }
             }
           }
+
+          # ---------- Inputs ----------
+          $tailnet   = "${{ inputs.ts_tailnet }}"
+          $apiKey    = "${{ inputs.ts_api_key }}"
+          $authKey   = "${{ inputs.ts_authkey }}"
+          $test      = Yes("${{ inputs.test_mode }}")
+          $runtime   = IntOr("${{ inputs.runtime_minutes }}" , 355); if ($test) { $runtime = 5 }; if (-not $test -and $runtime -lt 6) { $runtime = 355 }; if ($runtime -gt 360) { $runtime = 355 }
+          $doPurge   = Yes("${{ inputs.purge_bullet }}")
+          $cycles    = IntOr("${{ inputs.cycles }}", 0); $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
+
+          Summary "Inputs (A)" @(
+            "| Key | Value |","|---|---|",
+            "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |",
+            "| Hostname | $env:TS_HOSTNAME |",
+            "| Next target | $bOwner/$bRepo@$bRef → $bWorkflow |",
+            "| TransferRepo | " + ($(if ($xOwner) {"$xOwner/$xRepo#$xTag"} else {"(disabled)"})) + " |",
+            "| Telegram | " + ($tgEnabled) + " |"
+          )
+
+          TgSend ("🟦 *A started* in `${{ github.repository }}` on `${{ github.ref_name }}``nRuntime: *$runtime* min`nNext: *$bOwner/$bRepo* → *$bWorkflow*@*$bRef*")
 
           # ---------- Tailscale & RDP ----------
           function Ensure-Tailscale {
@@ -136,7 +177,7 @@ jobs:
             return [pscustomobject]@{ IPv4=$ip4; MagicDNS=$st.Self.DNSName; DERP=$st.Self.DERP }
           }
 
-          # ---------- Transfer (optional) ----------
+          # ---------- Transfer helpers (optional) ----------
           function X-Ensure-Release($owner,$repo,$tag,$pat){
             if([string]::IsNullOrWhiteSpace($owner)){ return $null }
             $base = "https://api.github.com/repos/$owner/$repo"
@@ -163,20 +204,6 @@ jobs:
             $hdr  = @{ Authorization="Bearer $pat"; "User-Agent"="xfer"; Accept="application/vnd.github+json" }
             Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -ContentType "application/zip" -InFile $filePath -UseBasicParsing | Out-Null
           }
-
-          # ---------- Inputs ----------
-          $tailnet   = "${{ inputs.ts_tailnet }}"
-          $apiKey    = "${{ inputs.ts_api_key }}"
-          $authKey   = "${{ inputs.ts_authkey }}"
-          $test      = Yes("${{ inputs.test_mode }}")
-          $runtime   = IntOr("${{ inputs.runtime_minutes }}" , 355); if ($test) { $runtime = 5 }; if (-not $test -and $runtime -lt 6) { $runtime = 355 }; if ($runtime -gt 360) { $runtime = 355 }
-          $doPurge   = Yes("${{ inputs.purge_bullet }}")
-          $bOwner    = "${{ inputs.b_owner }}"; $bRepo="${{ inputs.b_repo }}"; $bWorkflow="${{ inputs.b_workflow }}"; $bRef="${{ inputs.b_ref }}"; $bPAT="${{ inputs.b_pat }}"
-          $xOwner    = "${{ inputs.x_owner }}"; $xRepo="${{ inputs.x_repo }}"; $xPAT="${{ inputs.x_pat }}"; $xTag="${{ inputs.x_tag }}"
-          $cycles    = IntOr("${{ inputs.cycles }}", 0); $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
-
-          Summary "Inputs (A)" @("| Key | Value |","|---|---|","| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |","| Hostname | $env:TS_HOSTNAME |","| TransferRepo | $xOwner/$xRepo#$xTag |","| Next target | $bOwner/$bRepo@$bRef → $bWorkflow |")
-          TgSend ("🟦 *A started* in `${{ github.repository }}` on `${{ github.ref_name }}``nRuntime: *$runtime* min`nTarget next: *$bOwner/$bRepo* → *$bWorkflow*@*$bRef*")
 
           # ---------- Restore incoming data (from B) ----------
           if(-not [string]::IsNullOrWhiteSpace($xOwner)){
@@ -238,6 +265,7 @@ jobs:
 
           # Telegram final + dispatch notice
           TgSend ("🟦 *A finished* — dispatching to *$bOwner/$bRepo* → *$bWorkflow*@*$bRef*`n$($log.ToString())")
+
       - name: ⬆️ Upload screenshot (start)
         uses: actions/upload-artifact@v4
         with:
@@ -259,6 +287,18 @@ jobs:
           $cycles  = "${{ inputs.cycles }}"
           if ($cycles -eq "1") { Write-Host "Ping-pong cycles exhausted (1→0). Stop."; exit 0 }
 
+          # Rebuild pass-through JSONs (so B receives same options)
+          $A_JSON = @{
+            owner    = "${{ github.repository_owner }}"
+            repo     = "${{ github.event.repository.name }}"
+            workflow = "rdp-tailscale-A.yml"
+            ref      = "${{ github.ref_name }}"
+            pat      = ""   # optionally inject via secrets in Repo B if you want
+          } | ConvertTo-Json -Compress
+
+          $XFER = @'${{ inputs.xfer_json }}'@
+          $TG   = @'${{ inputs.tg_json }}'@
+
           $payload = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
             ts_api_key      = "${{ inputs.ts_api_key }}"
@@ -266,23 +306,22 @@ jobs:
             test_mode       = "false"
             runtime_minutes = "${{ inputs.runtime_minutes }}"
             purge_bullet    = "${{ inputs.purge_bullet }}"
-            a_owner         = "${{ github.repository_owner }}"
-            a_repo          = "${{ github.event.repository.name }}"
-            a_workflow      = "rdp-tailscale-A.yml"
-            a_ref           = "${{ github.ref_name }}"
-            a_pat           = "${{ secrets.A_PAT || '' }}"
-            x_owner         = "${{ inputs.x_owner }}"
-            x_repo          = "${{ inputs.x_repo }}"
-            x_pat           = "${{ inputs.x_pat }}"
-            x_tag           = "${{ inputs.x_tag }}"
-            tg_enable       = "${{ inputs.tg_enable }}"
-            tg_bot_token    = "${{ inputs.tg_bot_token }}"
-            tg_chat_id      = "${{ inputs.tg_chat_id }}"
+            a_json          = $A_JSON
+            xfer_json       = $XFER
+            tg_json         = $TG
             cycles          = "$(( [int](${{ inputs.cycles }}) -ge 1) ? ([int](${{ inputs.cycles }}) - 1) : 0)"
           }
 
-          $url = "https://api.github.com/repos/${{ inputs.b_owner }}/${{ inputs.b_repo }}/actions/workflows/${{ inputs.b_workflow }}/dispatches"
-          $hdr = @{ Authorization = "Bearer ${{ inputs.b_pat }}"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-A" }
-          $body = @{ ref = "${{ inputs.b_ref }}"; inputs = $payload } | ConvertTo-Json -Depth 8
-          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
-          Write-Host "Dispatched to ${{ inputs.b_owner }}/${{ inputs.b_repo }} → ${{ inputs.b_workflow }}"
+          $url = "https://api.github.com/repos/@{0}/@{1}/actions/workflows/@{2}/dispatches" -f @(
+            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty owner,
+            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty repo,
+            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty workflow
+          )
+
+          $bRef = (@'${{ inputs.b_json }}'@ | ConvertFrom-Json).ref
+          $bPAT = (@'${{ inputs.b_json }}'@ | ConvertFrom-Json).pat
+
+          $hdr = @{ Authorization = "Bearer $bPAT"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-A" }
+          $body = @{ ref = "$bRef"; inputs = $payload } | ConvertTo-Json -Depth 8
+          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+          Write-Host "Dispatched to Repo B."
