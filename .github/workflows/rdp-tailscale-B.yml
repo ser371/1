@@ -1,0 +1,231 @@
+name: RDP via Tailscale (B → A, same repo, Win2025 + screenshots + Telegram)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:      { required: true,  description: "Tailscale tailnet (e.g. you@gmail.com)" }
+      ts_api_key:      { required: true,  description: "Tailscale API key (device admin, no 'Bearer')" }
+      ts_authkey:      { required: true,  description: "Tailscale Auth key (reusable or ephemeral)" }
+      test_mode:
+        description: "Run 5-minute test"
+        type: boolean
+        default: false
+      runtime_minutes: { required: false, default: "355", description: "Runtime (max 360; capped 355)" }
+      purge_bullet:    { required: false, default: "true", description: "Purge 'bullet' devices at start/end" }
+
+      # optional JSONs (kept for parity with A; not used for data handoff here)
+      xfer_json:
+        description: "(optional) JSON transfer repo"
+        required: false
+        default: ""
+      tg_json:
+        description: "(optional) JSON telegram: {\"enable\":true,\"bot_token\":\"<TOKEN>\",\"chat_id\":\"<CHAT_ID>\"}"
+        required: false
+        default: ""
+
+      cycles:          { required: false, default: "0", description: "0=infinite; N=remaining handoffs incl. this run" }
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 370
+    env:
+      RDP_USER:    Bullettemporary
+      RDP_PASS:    Bullet@12345
+      TS_HOSTNAME: bullet
+    steps:
+      - name: Build & run (B)
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+
+          # ----- Parse optional JSON (Telegram) -----
+          $TRAW = "${{ inputs.tg_json }}"
+          $t = if (-not [string]::IsNullOrWhiteSpace($TRAW)) { $TRAW | ConvertFrom-Json } else { $null }
+          $tgEnabled = if ($t -and $t.enable) { [bool]$t.enable } else { $false }
+          $tgToken   = if ($t) { $t.bot_token } else { "" }
+          $tgChat    = if ($t) { $t.chat_id }   else { "" }
+          function TgSend([string]$text){
+            if(-not $tgEnabled){ return }
+            if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
+            for($i=0; $i -lt $text.Length; $i+=3900){
+              $chunk = $text.Substring($i, [Math]::Min(3900, $text.Length - $i))
+              try{
+                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
+                  -ContentType "application/x-www-form-urlencoded" `
+                  -Body @{chat_id=$tgChat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
+              }catch{ Write-Warning "Telegram send failed: $_" }
+            }
+          }
+
+          # ----- Inputs -----
+          $tailnet = "${{ inputs.ts_tailnet }}"
+          $apiKey  = "${{ inputs.ts_api_key }}"
+          $authKey = "${{ inputs.ts_authkey }}"
+          $test    = Yes("${{ inputs.test_mode }}")
+          $runtime = IntOr("${{ inputs.runtime_minutes }}", 355)
+          if ($test) { $runtime = 5 }
+          if (-not $test -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+          $doPurge = Yes("${{ inputs.purge_bullet }}")
+          $cycles  = IntOr("${{ inputs.cycles }}", 0)
+          $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
+
+          Summary "Inputs (B)" @(
+            "| Key | Value |","|---|---|",
+            "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |",
+            "| Hostname | $env:TS_HOSTNAME |","| Telegram | $tgEnabled |"
+          )
+          TgSend ("🟧 *B started* — runtime: $runtime min, next: A")
+
+          # ----- Tailscale install if needed -----
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          # ----- Enable RDP user + firewall -----
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+          # ----- Optional purge of previous 'bullet' devices -----
+          if($doPurge){
+            try{
+              $tn  = [uri]::EscapeUriString($tailnet)
+              $hdr = @{ Authorization = "Bearer $apiKey" }
+              $resp = Invoke-WebRequest -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers $hdr -UseBasicParsing
+              $json = $resp.Content | ConvertFrom-Json
+              foreach($d in $json.devices){
+                if( ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet') ){
+                  try{ Invoke-WebRequest -Method Delete -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null }
+                  catch{ Write-Warning "Delete failed for $($d.name): $_" }
+                }
+              }
+            }catch{ Write-Warning "Startup purge failed: $_" }
+          }
+
+          # ----- Tailscale up -----
+          & $exe logout | Out-Null
+          & $exe up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+          $ip4 = (& $exe ip -4 | Select-Object -First 1)
+          $st  = & $exe status --json | ConvertFrom-Json
+          Summary "RDP (B)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $($st.Self.DNSName)")
+
+          # ----- Screenshot (start) -----
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $bmp.Save("$env:RUNNER_TEMP\rdp-start.png",[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          } catch { Write-Warning "Start screenshot failed: $_" }
+
+          # ----- Keep alive + hourly reminders -----
+          $end = (Get-Date).AddMinutes($runtime); $lastHour = -1
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
+            Write-Host "RDP alive... ($left min left)"
+            $hr=[int][math]::Floor($left/60)
+            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *B reminder*: $left min left (~$hr h)") }
+            Start-Sleep -Seconds 60
+          }
+
+          # ----- Screenshot (end) -----
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $bmp.Save("$env:RUNNER_TEMP\rdp-end.png",[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+          } catch { Write-Warning "End screenshot failed: $_" }
+
+          # ----- Optional purge on exit -----
+          if($doPurge){
+            try{
+              $tn  = [uri]::EscapeUriString($tailnet)
+              $hdr = @{ Authorization = "Bearer $apiKey" }
+              $resp = Invoke-WebRequest -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers $hdr -UseBasicParsing
+              $json = $resp.Content | ConvertFrom-Json
+              foreach($d in $json.devices){
+                if( ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet') ){
+                  try{ Invoke-WebRequest -Method Delete -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null }
+                  catch{ Write-Warning "Delete failed for $($d.name): $_" }
+                }
+              }
+            }catch{ Write-Warning "Exit purge failed: $_" }
+          }
+
+          TgSend ("🟧 *B finished* — dispatching A")
+
+      - name: ⬆️ Upload screenshot (start)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-start-screenshot-B
+          path: ${{ runner.temp }}/rdp-start.png
+          if-no-files-found: warn
+
+      - name: ⬆️ Upload screenshot (end)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-end-screenshot-B
+          path: ${{ runner.temp }}/rdp-end.png
+          if-no-files-found: warn
+
+      - name: Dispatch A (same repo via GITHUB_TOKEN)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $payload = @{
+            ts_tailnet      = "${{ inputs.ts_tailnet }}"
+            ts_api_key      = "${{ inputs.ts_api_key }}"
+            ts_authkey      = "${{ inputs.ts_authkey }}"
+            test_mode       = "false"
+            runtime_minutes = "${{ inputs.runtime_minutes }}"
+            purge_bullet    = "${{ inputs.purge_bullet }}"
+            xfer_json       = "${{ inputs.xfer_json }}"
+            tg_json         = "${{ inputs.tg_json }}"
+            cycles          = "$(( [int](${{ inputs.cycles }}) -ge 1) ? ([int](${{ inputs.cycles }}) - 1) : 0)"
+          }
+          if ("${{ inputs.cycles }}" -eq "1") { Write-Host "Ping-pong cycles exhausted (1→0). Stop."; exit 0 }
+
+          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-A.yml/dispatches"
+          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-same-repo" }
+          $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
+          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+          Write-Host "Dispatched Workflow A in the same repo."
