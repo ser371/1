@@ -3,7 +3,6 @@ name: RDP via Tailscale (A → B, same repo, Win2025 + screenshots + data handof
 on:
   workflow_dispatch:
     inputs:
-      # --- Core (6) ---
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
       ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
@@ -14,26 +13,20 @@ on:
       runtime_minutes:   { description: "Runtime (max 360; capped 355)", required: false, default: "355" }
       purge_bullet:      { description: "Purge 'bullet' devices at start/end", required: false, default: "true" }
 
-      # --- Optional packed JSON (2) ---
       xfer_json:
-        description: >-
-          (optional) JSON transfer repo:
-          {"owner":"ACCOUNT","repo":"rdp-transfer","tag":"pingpong-handoff","pat":"ghp_<XFER_PAT>"}
+        description: "(optional) JSON transfer repo"
         required: false
         default: ""
       tg_json:
-        description: >-
-          (optional) JSON telegram:
-          {"enable":true,"bot_token":"<TOKEN>","chat_id":"<CHAT_ID>"}
+        description: "(optional) JSON telegram"
         required: false
         default: ""
 
-      # --- Ping-pong control (1) ---
       cycles:            { description: "0=infinite; N=remaining handoffs incl. this run", required: false, default: "0" }
 
 permissions:
   contents: read
-  actions: write   # needed to dispatch B via GITHUB_TOKEN
+  actions: write
 
 concurrency:
   group: tailscale-rdp-singleton
@@ -52,12 +45,12 @@ jobs:
       RDP_PASS:    Bullet@12345
       TS_HOSTNAME: bullet
       X_DIR:       C:\Users\Public\Transfer
+
     steps:
       - name: Build & run (A)
         run: |
           $ErrorActionPreference = "Stop"
 
-          # ---------- Utils ----------
           function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
@@ -65,28 +58,26 @@ jobs:
           function Log($s){ $null = $log.AppendLine($s); Write-Host $s }
 
           # ---------- Optional JSON parsing ----------
-          $XRAW = @'${{ inputs.xfer_json }}'@
-          $TRAW = @'${{ inputs.tg_json }}'@
+          $XRAW = "${{ inputs.xfer_json }}"
+          $TRAW = "${{ inputs.tg_json }}"
           $x = if (-not [string]::IsNullOrWhiteSpace($XRAW)) { $XRAW | ConvertFrom-Json } else { $null }
           $t = if (-not [string]::IsNullOrWhiteSpace($TRAW)) { $TRAW | ConvertFrom-Json } else { $null }
+
           $xOwner = if ($x) { $x.owner } else { "" }
           $xRepo  = if ($x) { $x.repo }  else { "" }
           $xTag   = if ($x -and $x.tag) { $x.tag } else { "pingpong-handoff" }
           $xPAT   = if ($x) { $x.pat }   else { "" }
+
           $tgEnabled = if ($t -and $t.enable) { [bool]$t.enable } else { $false }
           $tgToken   = if ($t) { $t.bot_token } else { "" }
           $tgChat    = if ($t) { $t.chat_id }   else { "" }
+
           function TgSend([string]$text){
             if(-not $tgEnabled){ return }
             if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
-            for($i=0; $i -lt $text.Length; $i+=3900){
-              $chunk = $text.Substring($i, [Math]::Min(3900, $text.Length - $i))
-              try{
-                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
-                  -ContentType "application/x-www-form-urlencoded" `
-                  -Body @{chat_id=$tgChat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
-              }catch{ Write-Warning "Telegram send failed: $_" }
-            }
+            Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
+              -ContentType "application/x-www-form-urlencoded" `
+              -Body @{chat_id=$tgChat; text=$text; parse_mode="Markdown"} -UseBasicParsing | Out-Null
           }
 
           # ---------- Inputs ----------
@@ -94,161 +85,75 @@ jobs:
           $apiKey    = "${{ inputs.ts_api_key }}"
           $authKey   = "${{ inputs.ts_authkey }}"
           $test      = Yes("${{ inputs.test_mode }}")
-          $runtime   = IntOr("${{ inputs.runtime_minutes }}" , 355); if ($test) { $runtime = 5 }; if (-not $test -and $runtime -lt 6) { $runtime = 355 }; if ($runtime -gt 360) { $runtime = 355 }
+          $runtime   = IntOr("${{ inputs.runtime_minutes }}" , 355)
+          if ($test) { $runtime = 5 }
+          if (-not $test -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+
           $doPurge   = Yes("${{ inputs.purge_bullet }}")
-          $cycles    = IntOr("${{ inputs.cycles }}", 0); $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
+          $cycles    = IntOr("${{ inputs.cycles }}", 0)
+          $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
 
           Summary "Inputs (A)" @(
             "| Key | Value |","|---|---|",
             "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |",
-            "| Hostname | $env:TS_HOSTNAME |",
-            "| TransferRepo | " + ($(if ($xOwner) {"$xOwner/$xRepo#$xTag"} else {"(disabled)"})) + " |",
-            "| Telegram | " + ($tgEnabled) + " |"
+            "| Hostname | $env:TS_HOSTNAME |"
           )
-          TgSend ("🟦 *A started* in `${{ github.repository }}` on `${{ github.ref_name }}``nRuntime: *$runtime* min`nNext: *Workflow B* in same repo")
+          TgSend ("🟦 *A started* — runtime: $runtime min, next: B")
 
-          # ---------- Tailscale & RDP ----------
-          function Ensure-Tailscale {
-            $exe = "C:\Program Files\Tailscale\tailscale.exe"
-            if (-not (Test-Path $exe)) {
-              $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
-              $dst = "$env:TEMP\tailscale-setup.exe"
-              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-              Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
-            }
-            Start-Service Tailscale -ErrorAction SilentlyContinue
+          # ---------- Install Tailscale ----------
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
-          function Enable-RDP($u,$p){
-            $sec = ConvertTo-SecureString $p -AsPlainText -Force
-            if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name $u -Password $sec -AccountNeverExpires | Out-Null
-              Add-LocalGroupMember -Group Administrators -Member $u
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
-            } else { Set-LocalUser -Name $u -Password $sec -AccountNeverExpires; Enable-LocalUser -Name $u }
-            Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-            Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          }
-          function Purge-Bullet($apiKey,$tailnet){
-            try{
-              $tn = [uri]::EscapeUriString($tailnet)
-              $hdr = @{ Authorization = "Bearer $apiKey" }
-              $resp = Invoke-WebRequest -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers $hdr -UseBasicParsing
-              $json = $resp.Content | ConvertFrom-Json
-              foreach($d in $json.devices){
-                if( ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet') ){
-                  try{ Invoke-WebRequest -Method Delete -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null; Log "Deleted: $($d.name)" }
-                  catch{ Write-Warning "Delete failed for $($d.name): $_" }
-                }
-              }
-            }catch{ Write-Warning "Purge failed: $_" }
-          }
-          function TS-Up($authKey,$hostname){
-            $ts = "C:\Program Files\Tailscale\tailscale.exe"
-            & $ts logout | Out-Null
-            & $ts up --authkey "$authKey" --hostname "$hostname" --accept-routes --accept-dns=false
-            Start-Sleep -Seconds 2
-            $ip4 = (& $ts ip -4 | Select-Object -First 1)
-            $st  = & $ts status --json | ConvertFrom-Json
-            return [pscustomobject]@{ IPv4=$ip4; MagicDNS=$st.Self.DNSName; DERP=$st.Self.DERP }
-          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
 
-          # ---------- Transfer helpers (optional) ----------
-          function X-Ensure-Release($owner,$repo,$tag,$pat){
-            if([string]::IsNullOrWhiteSpace($owner)){ return $null }
-            $base = "https://api.github.com/repos/$owner/$repo"
-            $hdr  = @{ Authorization="Bearer $pat"; "User-Agent"="xfer"; Accept="application/vnd.github+json" }
-            try { ($ (Invoke-WebRequest -Uri "$base/releases/tags/$tag" -Headers $hdr -UseBasicParsing).Content | ConvertFrom-Json).id }
-            catch {
-              $body = @{ tag_name=$tag; name=$tag; draft=$false; prerelease=$false } | ConvertTo-Json
-              ($ (Invoke-WebRequest -Method POST -Uri "$base/releases" -Headers $hdr -Body $body -UseBasicParsing).Content | ConvertFrom-Json).id
-            }
+          # ---------- Enable RDP ----------
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
           }
-          function X-Download-Latest($owner,$repo,$tag,$prefix,$outFile,$pat){
-            if([string]::IsNullOrWhiteSpace($owner)){ return $false }
-            $base = "https://api.github.com/repos/$owner/$repo"
-            $hdr  = @{ Authorization="Bearer $pat"; "User-Agent"="xfer"; Accept="application/vnd.github+json" }
-            $rels = (Invoke-WebRequest -Uri "$base/releases/tags/$tag" -Headers $hdr -UseBasicParsing).Content | ConvertFrom-Json
-            $asset = $rels.assets | Where-Object { $_.name -like "$prefix*" } | Sort-Object created_at -Descending | Select-Object -First 1
-            if (-not $asset) { return $false }
-            Invoke-WebRequest -Uri $asset.browser_download_url -Headers $hdr -OutFile $outFile -UseBasicParsing
-            return $true
-          }
-          function X-Upload-Asset($owner,$repo,$releaseId,$filePath,$name,$pat){
-            if([string]::IsNullOrWhiteSpace($owner)){ return }
-            $url  = "https://uploads.github.com/repos/$owner/$repo/releases/$releaseId/assets?name=$name"
-            $hdr  = @{ Authorization="Bearer $pat"; "User-Agent"="xfer"; Accept="application/vnd.github+json" }
-            Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -ContentType "application/zip" -InFile $filePath -UseBasicParsing | Out-Null
-          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # ---------- Restore incoming data (from B) ----------
-          if(-not [string]::IsNullOrWhiteSpace($xOwner)){
-            New-Item -ItemType Directory -Path $env:X_DIR -Force | Out-Null
-            $relId = X-Ensure-Release $xOwner $xRepo $xTag $xPAT
-            $inZip = Join-Path $env:RUNNER_TEMP "handoff_latest_from_B.zip"
-            if (X-Download-Latest $xOwner $xRepo $xTag "handoff_B_to_A_" $inZip $xPAT){
-              try { Expand-Archive -LiteralPath $inZip -DestinationPath $env:X_DIR -Force; Summary "Restore" @("Restored **$($inZip | Split-Path -Leaf)** → `$env:X_DIR`") }
-              catch { Write-Warning "Expand failed: $_" }
-            }
-          }
+          # ---------- Connect to Tailscale ----------
+          & $exe logout | Out-Null
+          & $exe up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
 
-          # ---------- RDP session ----------
-          Ensure-Tailscale; Enable-RDP $env:RDP_USER $env:RDP_PASS
-          if ($doPurge){ Purge-Bullet $apiKey $tailnet }
+          $ip4 = (& $exe ip -4 | Select-Object -First 1)
+          $st  = & $exe status --json | ConvertFrom-Json
+          Summary "RDP (A)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $($st.Self.DNSName)")
 
-          $net = TS-Up $authKey $env:TS_HOSTNAME
-          Summary "RDP (A)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $($net.IPv4)","**MagicDNS:** $($net.MagicDNS)","**DERP:** $($net.DERP)")
-          $null = $log.AppendLine("IPv4: $($net.IPv4)"); $null = $log.AppendLine("MagicDNS: $($net.MagicDNS)"); $null = $log.AppendLine("DERP: $($net.DERP)")
-
-          # Screenshot start
-          Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
-          $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $img=New-Object System.Drawing.Bitmap $b.Width,$b.Height
-          $g=[System.Drawing.Graphics]::FromImage($img); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
-          $startPng=Join-Path $env:RUNNER_TEMP "rdp-start.png"; $img.Save($startPng,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose();$img.Dispose()
-
-          # Keep alive + hourly reminders
+          # ---------- Keep alive ----------
           $end=(Get-Date).AddMinutes($runtime); $lastHour=-1
           while((Get-Date) -lt $end){
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
             Write-Host "RDP alive... ($left min left)"
             $hr=[int][math]::Floor($left/60)
-            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *A reminder*: $left min left (`$hr h approx`)") }
+            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ A reminder: $left min left") }
             Start-Sleep -Seconds 60
           }
 
-          # Screenshot end
-          try {
-            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
-            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $img=New-Object System.Drawing.Bitmap $b.Width,$b.Height
-            $g=[System.Drawing.Graphics]::FromImage($img); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
-            $endPng=Join-Path $env:RUNNER_TEMP "rdp-end.png"; $img.Save($endPng,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose();$img.Dispose()
-          } catch { Write-Warning "Exit screenshot failed: $_" }
+          TgSend ("🟦 *A finished* — dispatching B")
 
-          if ($doPurge){ Purge-Bullet $apiKey $tailnet }
-
-          # Package & upload outgoing data (to B)
-          if(-not [string]::IsNullOrWhiteSpace($xOwner)){
-            $relId = X-Ensure-Release $xOwner $xRepo $xTag $xPAT
-            $stamp=(Get-Date).ToString("yyyyMMdd_HHmmss")
-            $outZip = Join-Path $env:RUNNER_TEMP ("handoff_A_to_B_{0}.zip" -f $stamp)
-            if (Test-Path $env:X_DIR -and (Get-ChildItem -Path $env:X_DIR -Recurse -Force | Where-Object { -not $_.PSIsContainer })) {
-              if (Test-Path $outZip) { Remove-Item $outZip -Force }
-              Compress-Archive -Path (Join-Path $env:X_DIR '*') -DestinationPath $outZip -Force
-              X-Upload-Asset $xOwner $xRepo $relId $outZip ($outZip | Split-Path -Leaf) $xPAT
-              Summary "Package" @("Uploaded **$($outZip | Split-Path -Leaf)** to **$xOwner/$xRepo** release **$xTag**")
-            }
-          }
-
-          # Telegram final
-          TgSend ("🟦 *A finished* — dispatching *Workflow B* in same repo`n$($log.ToString())")
-
-      - name: ⬆️ Upload screenshot (start)
+      - name: Upload screenshot (start)
         uses: actions/upload-artifact@v4
         with:
           name: rdp-start-screenshot-A
           path: ${{ runner.temp }}/rdp-start.png
           if-no-files-found: warn
 
-      - name: ⬆️ Upload screenshot (end)
+      - name: Upload screenshot (end)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -261,8 +166,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $cycles  = "${{ inputs.cycles }}"
-          if ($cycles -eq "1") { Write-Host "Ping-pong cycles exhausted (1→0). Stop."; exit 0 }
+          $xfer_json = "${{ inputs.xfer_json }}"
+          $tg_json  = "${{ inputs.tg_json }}"
 
           $payload = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
@@ -271,15 +176,13 @@ jobs:
             test_mode       = "false"
             runtime_minutes = "${{ inputs.runtime_minutes }}"
             purge_bullet    = "${{ inputs.purge_bullet }}"
-            # pass-through JSON
-            a_cycles_dummy  = ""   # placeholder not used
-            xfer_json       = @'${{ inputs.xfer_json }}'@
-            tg_json         = @'${{ inputs.tg_json }}'@
+            xfer_json       = $xfer_json
+            tg_json         = $tg_json
             cycles          = "$(( [int](${{ inputs.cycles }}) -ge 1) ? ([int](${{ inputs.cycles }}) - 1) : 0)"
           }
 
           $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
-          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-same-repo" }
+          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
           $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
           Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
-          Write-Host "Dispatched Workflow B in the same repo."
+          Write-Host "Dispatched Workflow B"
