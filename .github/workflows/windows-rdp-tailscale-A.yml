@@ -1,4 +1,4 @@
-name: RDP via Tailscale (A → B, same repo, Win2025 + screenshots + data handoff + Telegram)
+name: RDP via Tailscale (A → B, same repo, Win2025 + screenshots + Telegram photos)
 
 on:
   workflow_dispatch:
@@ -14,11 +14,11 @@ on:
       purge_bullet:      { description: "Purge 'bullet' devices at start/end", required: false, default: "true" }
 
       xfer_json:
-        description: "(optional) JSON transfer repo"
+        description: "(optional) JSON transfer repo: {\"owner\":\"ACCOUNT\",\"repo\":\"rdp-transfer\",\"tag\":\"pingpong-handoff\",\"pat\":\"ghp_xxx\"}"
         required: false
         default: ""
       tg_json:
-        description: "(optional) JSON telegram"
+        description: "(optional) JSON telegram: {\"enable\":true,\"bot_token\":\"<TOKEN>\",\"chat_id\":\"<CHAT_ID>\"}"
         required: false
         default: ""
 
@@ -57,7 +57,7 @@ jobs:
           $log = New-Object System.Text.StringBuilder
           function Log($s){ $null = $log.AppendLine($s); Write-Host $s }
 
-          # ---------- Optional JSON parsing ----------
+          # ----- Optional JSON parsing (xfer / Telegram) -----
           $XRAW = "${{ inputs.xfer_json }}"
           $TRAW = "${{ inputs.tg_json }}"
           $x = if (-not [string]::IsNullOrWhiteSpace($XRAW)) { $XRAW | ConvertFrom-Json } else { $null }
@@ -75,21 +75,39 @@ jobs:
           function TgSend([string]$text){
             if(-not $tgEnabled){ return }
             if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
-            Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
-              -ContentType "application/x-www-form-urlencoded" `
-              -Body @{chat_id=$tgChat; text=$text; parse_mode="Markdown"} -UseBasicParsing | Out-Null
+            for($i=0; $i -lt $text.Length; $i+=3900){
+              $chunk = $text.Substring($i, [Math]::Min(3900, $text.Length - $i))
+              try{
+                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendMessage" `
+                  -ContentType "application/x-www-form-urlencoded" `
+                  -Body @{chat_id=$tgChat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
+              }catch{ Write-Warning "Telegram send failed: $_" }
+            }
+          }
+          function TgSendPhoto([string]$path, [string]$caption){
+            if(-not $tgEnabled){ return }
+            if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
+            if(-not (Test-Path -LiteralPath $path)){ return }
+            try{
+              $form = @{ chat_id=$tgChat; caption=$caption; parse_mode="Markdown"; photo=Get-Item -LiteralPath $path }
+              Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendPhoto" -Form $form -UseBasicParsing | Out-Null
+            } catch {
+              try{
+                $form = @{ chat_id=$tgChat; caption=$caption; parse_mode="Markdown"; document=Get-Item -LiteralPath $path }
+                Invoke-WebRequest -Method POST -Uri "https://api.telegram.org/bot$tgToken/sendDocument" -Form $form -UseBasicParsing | Out-Null
+              } catch { Write-Warning "Telegram screenshot send failed: $_" }
+            }
           }
 
-          # ---------- Inputs ----------
+          # ----- Inputs -----
           $tailnet   = "${{ inputs.ts_tailnet }}"
           $apiKey    = "${{ inputs.ts_api_key }}"
           $authKey   = "${{ inputs.ts_authkey }}"
           $test      = Yes("${{ inputs.test_mode }}")
-          $runtime   = IntOr("${{ inputs.runtime_minutes }}" , 355)
+          $runtime   = IntOr("${{ inputs.runtime_minutes }}", 355)
           if ($test) { $runtime = 5 }
           if (-not $test -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
-
           $doPurge   = Yes("${{ inputs.purge_bullet }}")
           $cycles    = IntOr("${{ inputs.cycles }}", 0)
           $nextCycles = if ($cycles -gt 0) { $cycles - 1 } else { 0 }
@@ -97,11 +115,13 @@ jobs:
           Summary "Inputs (A)" @(
             "| Key | Value |","|---|---|",
             "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |",
-            "| Hostname | $env:TS_HOSTNAME |"
+            "| Hostname | $env:TS_HOSTNAME |",
+            "| TransferRepo | " + ($(if ($xOwner) {"$xOwner/$xRepo#$xTag"} else {"(disabled)"})) + " |",
+            "| Telegram | " + ($tgEnabled) + " |"
           )
-          TgSend ("🟦 *A started* — runtime: $runtime min, next: B")
+          TgSend ("🟦 *A started* — runtime: *$runtime* min; next: *B*")
 
-          # ---------- Install Tailscale ----------
+          # ----- Install Tailscale if needed -----
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
             $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
@@ -111,7 +131,7 @@ jobs:
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
 
-          # ---------- Enable RDP ----------
+          # ----- Enable RDP user + firewall -----
           $u=$env:RDP_USER; $p=$env:RDP_PASS
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
@@ -125,35 +145,92 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # ---------- Connect to Tailscale ----------
+          # ----- Optional purge -----
+          if($doPurge){
+            try{
+              $tn  = [uri]::EscapeUriString($tailnet)
+              $hdr = @{ Authorization = "Bearer $apiKey" }
+              $resp = Invoke-WebRequest -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers $hdr -UseBasicParsing
+              $json = $resp.Content | ConvertFrom-Json
+              foreach($d in $json.devices){
+                if( ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet') ){
+                  try{ Invoke-WebRequest -Method Delete -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null }
+                  catch{ Write-Warning "Delete failed for $($d.name): $_" }
+                }
+              }
+            }catch{ Write-Warning "Startup purge failed: $_" }
+          }
+
+          # ----- Tailscale up -----
           & $exe logout | Out-Null
           & $exe up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
           Start-Sleep -Seconds 2
-
           $ip4 = (& $exe ip -4 | Select-Object -First 1)
           $st  = & $exe status --json | ConvertFrom-Json
           Summary "RDP (A)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $($st.Self.DNSName)")
 
-          # ---------- Keep alive ----------
+          # ----- Screenshot (start) + Telegram photo -----
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $startP="$env:RUNNER_TEMP\rdp-start.png"
+            $bmp.Save($startP,[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            TgSendPhoto $startP ("🖼 *A start screenshot* — {0}" -f (Get-Date).ToString("HH:mm:ss 'IST' dd-MMM"))
+          } catch { Write-Warning "Start screenshot failed: $_" }
+
+          # ----- Keep alive + hourly reminders -----
           $end=(Get-Date).AddMinutes($runtime); $lastHour=-1
           while((Get-Date) -lt $end){
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
             Write-Host "RDP alive... ($left min left)"
             $hr=[int][math]::Floor($left/60)
-            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ A reminder: $left min left") }
+            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *A reminder*: $left min left (~$hr h)") }
             Start-Sleep -Seconds 60
           }
 
-          TgSend ("🟦 *A finished* — dispatching B")
+          # ----- Screenshot (end) + Telegram photo -----
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $endP="$env:RUNNER_TEMP\rdp-end.png"
+            $bmp.Save($endP,[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            TgSendPhoto $endP ("🖼 *A end screenshot* — {0}" -f (Get-Date).ToString("HH:mm:ss 'IST' dd-MMM"))
+          } catch { Write-Warning "End screenshot failed: $_" }
 
-      - name: Upload screenshot (start)
+          # ----- Optional purge on exit -----
+          if($doPurge){
+            try{
+              $tn  = [uri]::EscapeUriString($tailnet)
+              $hdr = @{ Authorization = "Bearer $apiKey" }
+              $resp = Invoke-WebRequest -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers $hdr -UseBasicParsing
+              $json = $resp.Content | ConvertFrom-Json
+              foreach($d in $json.devices){
+                if( ($d.name -match '(?i)bullet') -or ($d.hostname -match '(?i)bullet') -or ($d.DNSName -match '(?i)bullet') ){
+                  try{ Invoke-WebRequest -Method Delete -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) -Headers $hdr -UseBasicParsing | Out-Null }
+                  catch{ Write-Warning "Delete failed for $($d.name): $_" }
+                }
+              }
+            }catch{ Write-Warning "Exit purge failed: $_" }
+          }
+
+          TgSend ("🟦 *A finished* — dispatching *B*")
+
+      - name: ⬆️ Upload screenshot (start)
         uses: actions/upload-artifact@v4
         with:
           name: rdp-start-screenshot-A
           path: ${{ runner.temp }}/rdp-start.png
           if-no-files-found: warn
 
-      - name: Upload screenshot (end)
+      - name: ⬆️ Upload screenshot (end)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -166,8 +243,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $xfer_json = "${{ inputs.xfer_json }}"
-          $tg_json  = "${{ inputs.tg_json }}"
+          if ("${{ inputs.cycles }}" -eq "1") { Write-Host "Ping-pong cycles exhausted (1→0). Stop."; exit 0 }
 
           $payload = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
@@ -176,13 +252,13 @@ jobs:
             test_mode       = "false"
             runtime_minutes = "${{ inputs.runtime_minutes }}"
             purge_bullet    = "${{ inputs.purge_bullet }}"
-            xfer_json       = $xfer_json
-            tg_json         = $tg_json
+            xfer_json       = "${{ inputs.xfer_json }}"
+            tg_json         = "${{ inputs.tg_json }}"
             cycles          = "$(( [int](${{ inputs.cycles }}) -ge 1) ? ([int](${{ inputs.cycles }}) - 1) : 0)"
           }
 
           $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
-          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-same-repo" }
           $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
           Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
-          Write-Host "Dispatched Workflow B"
+          Write-Host "Dispatched Workflow B in the same repo."
