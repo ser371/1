@@ -5,19 +5,19 @@ on:
     inputs:
       ts_tailnet:
         description: "Tailscale tailnet (e.g. you@gmail.com)"
-        required: true
+        required: false
       ts_api_key:
         description: "Tailscale API key (device admin, no 'Bearer')"
-        required: true
+        required: false
       ts_authkey:
         description: "Tailscale auth key (reusable or ephemeral)"
-        required: true
+        required: false
       gh_api_token:
         description: "GitHub PAT with access to Repo A & Repo B"
-        required: true
+        required: false
       b_repo:
         description: "Target repo for Workflow B (owner/repo)"
-        required: true
+        required: false
       test_mode:
         description: "Run 5-minute test loop"
         type: boolean
@@ -30,6 +30,10 @@ on:
         description: "How many handoffs (0 = infinite)"
         required: false
         default: "0"
+      save_data:
+        description: "Save these values for next run?"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -49,16 +53,28 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      # --- SAME STEPS AS EARLIER (resolve inputs, install tailscale, enable RDP, purge, tailscale up, keep-alive, purge exit) ---
-      # Keep the fixed "Resolve inputs" block with improved test_mode handling
+      - name: 📥 Restore saved config if inputs are empty
+        id: restore
+        run: |
+          $file = "$env:GITHUB_WORKSPACE/saved-config.json"
+          if (Test-Path $file) {
+            Write-Host "Found saved config"
+            $cfg = Get-Content $file | ConvertFrom-Json
+            "tailnet=$($cfg.ts_tailnet)"   | Out-File -Append $env:GITHUB_OUTPUT
+            "apikey=$($cfg.ts_api_key)"    | Out-File -Append $env:GITHUB_OUTPUT
+            "authkey=$($cfg.ts_authkey)"   | Out-File -Append $env:GITHUB_OUTPUT
+            "pat=$($cfg.gh_api_token)"     | Out-File -Append $env:GITHUB_OUTPUT
+            "b_repo=$($cfg.b_repo)"        | Out-File -Append $env:GITHUB_OUTPUT
+          }
+
       - name: 🔧 Resolve inputs (safe)
         id: cfg
         env:
-          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
-          RAW_APIKEY:   ${{ inputs.ts_api_key }}
-          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
-          RAW_PAT:      ${{ inputs.gh_api_token }}
-          RAW_BREPO:    ${{ inputs.b_repo }}
+          RAW_TAILNET:  ${{ inputs.ts_tailnet || steps.restore.outputs.tailnet }}
+          RAW_APIKEY:   ${{ inputs.ts_api_key || steps.restore.outputs.apikey }}
+          RAW_AUTHKEY:  ${{ inputs.ts_authkey || steps.restore.outputs.authkey }}
+          RAW_PAT:      ${{ inputs.gh_api_token || steps.restore.outputs.pat }}
+          RAW_BREPO:    ${{ inputs.b_repo || steps.restore.outputs.b_repo }}
           RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
           RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
           RAW_LOOPS:    ${{ inputs.loops || '0' }}
@@ -87,7 +103,19 @@ jobs:
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
 
-      # (install tailscale, enable RDP, purge startup, tailscale up, keep alive, purge exit)
+      - name: 💾 Save config for future runs
+        if: ${{ inputs.save_data }}
+        run: |
+          $cfg = @{
+            ts_tailnet   = "${{ steps.cfg.outputs.tailnet }}"
+            ts_api_key   = "${{ steps.cfg.outputs.apikey }}"
+            ts_authkey   = "${{ steps.cfg.outputs.authkey }}"
+            gh_api_token = "${{ steps.cfg.outputs.pat }}"
+            b_repo       = "${{ steps.cfg.outputs.b_repo }}"
+          }
+          $cfg | ConvertTo-Json | Out-File "$env:GITHUB_WORKSPACE/saved-config.json" -Encoding utf8
+
+      # … (install tailscale, enable RDP, purge, up, keep-alive, purge exit)
 
       - name: 🔁 Dispatch workflow B (different repo)
         if: always()
@@ -108,6 +136,7 @@ jobs:
               test_mode       = "false"
               runtime_minutes = "${{ steps.cfg.outputs.runtime }}"
               loops           = "$next"
+              save_data       = "${{ inputs.save_data }}"
             }
           } | ConvertTo-Json -Depth 5
           Invoke-RestMethod -Method POST `
