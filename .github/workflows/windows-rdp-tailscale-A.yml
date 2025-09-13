@@ -1,4 +1,4 @@
-name: RDP via Tailscale (A → B, Win2025 + screenshots + data handoff + Telegram, <=10 inputs)
+name: RDP via Tailscale (A → B, same repo, Win2025 + screenshots + data handoff + Telegram)
 
 on:
   workflow_dispatch:
@@ -14,17 +14,11 @@ on:
       runtime_minutes:   { description: "Runtime (max 360; capped 355)", required: false, default: "355" }
       purge_bullet:      { description: "Purge 'bullet' devices at start/end", required: false, default: "true" }
 
-      # --- Packed JSON inputs (3) ---
-      b_json:
-        description: >-
-          JSON for Repo B dispatch:
-          {"owner":"ACCOUNT2","repo":"REPO_B","workflow":"rdp-tailscale-B.yml","ref":"main","pat":"<B_PAT>"}
-        required: true
-        default: ""
+      # --- Optional packed JSON (2) ---
       xfer_json:
         description: >-
           (optional) JSON transfer repo:
-          {"owner":"ACCOUNT2","repo":"rdp-transfer","tag":"pingpong-handoff","pat":"<XFER_PAT>"}
+          {"owner":"ACCOUNT","repo":"rdp-transfer","tag":"pingpong-handoff","pat":"ghp_<XFER_PAT>"}
         required: false
         default: ""
       tg_json:
@@ -39,7 +33,7 @@ on:
 
 permissions:
   contents: read
-  actions: write
+  actions: write   # needed to dispatch B via GITHUB_TOKEN
 
 concurrency:
   group: tailscale-rdp-singleton
@@ -70,38 +64,21 @@ jobs:
           $log = New-Object System.Text.StringBuilder
           function Log($s){ $null = $log.AppendLine($s); Write-Host $s }
 
-          # ---------- Parse packed JSON inputs safely ----------
-          $BRAW = @'${{ inputs.b_json }}'@
+          # ---------- Optional JSON parsing ----------
           $XRAW = @'${{ inputs.xfer_json }}'@
           $TRAW = @'${{ inputs.tg_json }}'@
-
-          $b = if (-not [string]::IsNullOrWhiteSpace($BRAW)) { $BRAW | ConvertFrom-Json } else { $null }
           $x = if (-not [string]::IsNullOrWhiteSpace($XRAW)) { $XRAW | ConvertFrom-Json } else { $null }
           $t = if (-not [string]::IsNullOrWhiteSpace($TRAW)) { $TRAW | ConvertFrom-Json } else { $null }
-
-          if (-not $b -or -not $b.owner -or -not $b.repo -or -not $b.workflow -or -not $b.ref -or -not $b.pat) {
-            Write-Error "b_json is missing required fields (owner, repo, workflow, ref, pat)."; exit 1
-          }
-
-          $bOwner    = $b.owner
-          $bRepo     = $b.repo
-          $bWorkflow = $b.workflow
-          $bRef      = $b.ref
-          $bPAT      = $b.pat
-
           $xOwner = if ($x) { $x.owner } else { "" }
           $xRepo  = if ($x) { $x.repo }  else { "" }
           $xTag   = if ($x -and $x.tag) { $x.tag } else { "pingpong-handoff" }
           $xPAT   = if ($x) { $x.pat }   else { "" }
-
           $tgEnabled = if ($t -and $t.enable) { [bool]$t.enable } else { $false }
           $tgToken   = if ($t) { $t.bot_token } else { "" }
           $tgChat    = if ($t) { $t.chat_id }   else { "" }
-
           function TgSend([string]$text){
             if(-not $tgEnabled){ return }
             if([string]::IsNullOrWhiteSpace($tgToken) -or [string]::IsNullOrWhiteSpace($tgChat)){ return }
-            # Send in chunks <4096 chars
             for($i=0; $i -lt $text.Length; $i+=3900){
               $chunk = $text.Substring($i, [Math]::Min(3900, $text.Length - $i))
               try{
@@ -125,12 +102,10 @@ jobs:
             "| Key | Value |","|---|---|",
             "| TestMode | $test |","| Runtime | $runtime |","| CyclesLeft | $cycles |",
             "| Hostname | $env:TS_HOSTNAME |",
-            "| Next target | $bOwner/$bRepo@$bRef → $bWorkflow |",
             "| TransferRepo | " + ($(if ($xOwner) {"$xOwner/$xRepo#$xTag"} else {"(disabled)"})) + " |",
             "| Telegram | " + ($tgEnabled) + " |"
           )
-
-          TgSend ("🟦 *A started* in `${{ github.repository }}` on `${{ github.ref_name }}``nRuntime: *$runtime* min`nNext: *$bOwner/$bRepo* → *$bWorkflow*@*$bRef*")
+          TgSend ("🟦 *A started* in `${{ github.repository }}` on `${{ github.ref_name }}``nRuntime: *$runtime* min`nNext: *Workflow B* in same repo")
 
           # ---------- Tailscale & RDP ----------
           function Ensure-Tailscale {
@@ -263,8 +238,8 @@ jobs:
             }
           }
 
-          # Telegram final + dispatch notice
-          TgSend ("🟦 *A finished* — dispatching to *$bOwner/$bRepo* → *$bWorkflow*@*$bRef*`n$($log.ToString())")
+          # Telegram final
+          TgSend ("🟦 *A finished* — dispatching *Workflow B* in same repo`n$($log.ToString())")
 
       - name: ⬆️ Upload screenshot (start)
         uses: actions/upload-artifact@v4
@@ -281,23 +256,13 @@ jobs:
           path: ${{ runner.temp }}/rdp-end.png
           if-no-files-found: warn
 
-      - name: Dispatch B (cross-account)
+      - name: Dispatch B (same repo via GITHUB_TOKEN)
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $cycles  = "${{ inputs.cycles }}"
           if ($cycles -eq "1") { Write-Host "Ping-pong cycles exhausted (1→0). Stop."; exit 0 }
-
-          # Rebuild pass-through JSONs (so B receives same options)
-          $A_JSON = @{
-            owner    = "${{ github.repository_owner }}"
-            repo     = "${{ github.event.repository.name }}"
-            workflow = "rdp-tailscale-A.yml"
-            ref      = "${{ github.ref_name }}"
-            pat      = ""   # optionally inject via secrets in Repo B if you want
-          } | ConvertTo-Json -Compress
-
-          $XFER = @'${{ inputs.xfer_json }}'@
-          $TG   = @'${{ inputs.tg_json }}'@
 
           $payload = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
@@ -306,22 +271,15 @@ jobs:
             test_mode       = "false"
             runtime_minutes = "${{ inputs.runtime_minutes }}"
             purge_bullet    = "${{ inputs.purge_bullet }}"
-            a_json          = $A_JSON
-            xfer_json       = $XFER
-            tg_json         = $TG
+            # pass-through JSON
+            a_cycles_dummy  = ""   # placeholder not used
+            xfer_json       = @'${{ inputs.xfer_json }}'@
+            tg_json         = @'${{ inputs.tg_json }}'@
             cycles          = "$(( [int](${{ inputs.cycles }}) -ge 1) ? ([int](${{ inputs.cycles }}) - 1) : 0)"
           }
 
-          $url = "https://api.github.com/repos/@{0}/@{1}/actions/workflows/@{2}/dispatches" -f @(
-            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty owner,
-            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty repo,
-            @'${{ inputs.b_json }}'@ | ConvertFrom-Json | Select-Object -ExpandProperty workflow
-          )
-
-          $bRef = (@'${{ inputs.b_json }}'@ | ConvertFrom-Json).ref
-          $bPAT = (@'${{ inputs.b_json }}'@ | ConvertFrom-Json).pat
-
-          $hdr = @{ Authorization = "Bearer $bPAT"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-A" }
-          $body = @{ ref = "$bRef"; inputs = $payload } | ConvertTo-Json -Depth 8
+          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json"; "User-Agent" = "rdp-pingpong-same-repo" }
+          $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
           Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
-          Write-Host "Dispatched to Repo B."
+          Write-Host "Dispatched Workflow B in the same repo."
