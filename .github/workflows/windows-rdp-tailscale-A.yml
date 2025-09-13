@@ -1,4 +1,4 @@
-name: RDP via Tailscale (A → B, per-field inputs, save-data, Win2025)
+name: RDP via Tailscale (A → B, per-field, save-data, Win2025)
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ on:
         default: true
 
 permissions:
-  contents: write   # needed for saving config
+  contents: write
   actions: write
 
 concurrency:
@@ -57,30 +57,34 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           function IntOr($v,$def){ if("$v" -match '^\s*\d+\s*$'){ [int]$v } else { [int]$def } }
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function Fill($in,$cfg){ if([string]::IsNullOrWhiteSpace($in) -and $cfg){$cfg}else{$in} }
           function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
 
           # --- Load saved config (if present)
           $CfgPath = Join-Path $env:GITHUB_WORKSPACE ".github\rdp-config.json"
           $cfg = $null
-          if (Test-Path -LiteralPath $CfgPath) {
-            try { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json } catch {}
-          }
+          if (Test-Path -LiteralPath $CfgPath) { try { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json } catch {} }
 
           # --- Resolve inputs (per-field)
           $tailnet   = Fill "${{ inputs.ts_tailnet }}"  $cfg.ts_tailnet
           $apiKey    = Fill "${{ inputs.ts_api_key }}"  $cfg.ts_api_key
           $authKey   = Fill "${{ inputs.ts_authkey }}"  $cfg.ts_authkey
+
+          # robust boolean for test mode
+          $rawTest = "${{ inputs.test_mode }}"
+          $test = $rawTest -match '^(?i:true|1|yes|on)$'
+
           $runtime   = IntOr("${{ inputs.runtime_minutes }}", $(if($cfg.runtime_minutes){[int]$cfg.runtime_minutes}else{355}))
-          if (${{ inputs.test_mode }}) { $runtime = 5 } elseif ($runtime -gt 360) { $runtime = 355 } elseif ($runtime -lt 6) { $runtime = 355 }
+          if ($test) { $runtime = 5 }
+          elseif ($runtime -gt 360) { $runtime = 355 }
+          elseif ($runtime -lt 6)  { $runtime = 355 }
 
           $bRepoPath = Fill "${{ inputs.b_repo_path }}" $cfg.b_repo_path
           $ghTokenB  = Fill "${{ inputs.gh_token_b }}"  $cfg.gh_token_b
 
           $tgToken   = Fill "${{ inputs.tg_token }}"    $cfg.tg_token
           $tgChat    = Fill "${{ inputs.tg_chat }}"     $cfg.tg_chat
-          $tgEnabled = -not [string]::IsNullOrWhiteSpace($tgToken) -and -not [string]::IsNullOrWhiteSpace($tgChat)
+          $tgEnabled = (-not [string]::IsNullOrWhiteSpace($tgToken)) -and (-not [string]::IsNullOrWhiteSpace($tgChat))
 
           # --- Telegram helpers
           function TgSend([string]$text){
@@ -106,6 +110,9 @@ jobs:
               }catch{}
             }
           }
+
+          # --- DEBUG: visible ping so you can confirm Telegram early
+          TgSend ("✅ Telegram ping (A) at {0}" -f (Get-Date).ToString("HH:mm:ss 'IST' dd-MMM"))
 
           # --- Install + enable Tailscale & RDP
           $ts="C:\Program Files\Tailscale\tailscale.exe"
@@ -135,13 +142,8 @@ jobs:
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
           $st  = & $ts status --json | ConvertFrom-Json
 
-          Summary "RDP (A)" @(
-            "**User:** $env:RDP_USER",
-            "**Pass:** $env:RDP_PASS",
-            "**IPv4:** $ip4",
-            "**MagicDNS:** $($st.Self.DNSName)"
-          )
-          TgSend ("🟦 *A started* — runtime: *$runtime* min; next: *B*")
+          Summary "RDP (A)" @("**User:** $env:RDP_USER","**Pass:** $env:RDP_PASS","**IPv4:** $ip4","**MagicDNS:** $($st.Self.DNSName)")
+          TgSend ("🟦 *A started* — runtime: *{0}* min; next: *B*" -f $runtime)
 
           # --- Screenshot (start)
           try {
@@ -162,7 +164,7 @@ jobs:
             $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
             Write-Host "RDP alive... ($left min left)"
             $hr=[int][math]::Floor($left/60)
-            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *A reminder*: $left min left (~$hr h)") }
+            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *A reminder*: {0} min left (~{1} h)" -f $left,$hr) }
             Start-Sleep -Seconds 60
           }
 
@@ -200,14 +202,11 @@ jobs:
           $targetRepo = if([string]::IsNullOrWhiteSpace($bRepoPath)){"${{ github.repository }}"}else{$bRepoPath}
           $sameRepo   = ($targetRepo -eq "${{ github.repository }}")
           $token      = if($sameRepo){"${{ github.token }}"}else{$ghTokenB}
-          if(-not $sameRepo -and [string]::IsNullOrWhiteSpace($token)){
-            Write-Error "b_repo_path is set, but gh_token_b is empty."
-            exit 1
-          }
+          if(-not $sameRepo -and [string]::IsNullOrWhiteSpace($token)){ Write-Error "b_repo_path is set, but gh_token_b is empty."; exit 1 }
 
           $payload=@{
             ts_tailnet=$tailnet; ts_api_key=$apiKey; ts_authkey=$authKey;
-            test_mode="false"; runtime_minutes="$runtime";
+            test_mode="$test"; runtime_minutes="$runtime";
             tg_token=$tgToken; tg_chat=$tgChat; save_data="${{ inputs.save_data }}"
           }
           $url="https://api.github.com/repos/$targetRepo/actions/workflows/rdp-tailscale-B.yml/dispatches"
